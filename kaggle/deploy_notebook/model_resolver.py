@@ -32,6 +32,7 @@ def read_gguf_metadata_summary(model_path: Path) -> Dict[str, Any]:
         "architecture": "unknown",
         "n_layers": 64,
         "has_chat_template": False,
+        "chat_template_source": "UNVERIFIED_TEMPLATE",
         "auxiliary_tensors": [],
         "file_size_gb": round(model_path.stat().st_size / (1024 ** 3), 2) if model_path.exists() else 0.0,
     }
@@ -40,7 +41,8 @@ def read_gguf_metadata_summary(model_path: Path) -> Dict[str, Any]:
 
     try:
         with open(model_path, "rb") as f:
-            header_chunk = f.read(1024 * 1024 * 2)  # Read first 2MB for metadata header
+            # Read first 12MB of header: accommodates large Qwen vocabulary tables & tokenizer metadata
+            header_chunk = f.read(1024 * 1024 * 12)
             if not header_chunk.startswith(b"GGUF"):
                 return summary
 
@@ -52,8 +54,11 @@ def read_gguf_metadata_summary(model_path: Path) -> Dict[str, Any]:
                     summary["architecture"] = arch.decode("ascii")
                     break
 
-            if b"chat_template" in header_chunk:
+            if b"tokenizer.chat_template" in header_chunk or b"chat_template" in header_chunk:
                 summary["has_chat_template"] = True
+                summary["chat_template_source"] = "EMBEDDED_GGUF_TEMPLATE"
+            else:
+                summary["chat_template_source"] = "RUNTIME_BUILTIN_FALLBACK"
 
             # Cautious scan: check for blk.64 and auxiliary prediction components
             aux_tensors = []

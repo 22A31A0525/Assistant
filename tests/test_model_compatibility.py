@@ -61,3 +61,24 @@ def test_catalog_qwen38_manifest_attachment():
     assert model.manifest is not None
     assert model.manifest.model_id == "qwen38-27b"
     assert model.manifest.projector_filename == "mmproj-Qwen3.8-27B-f16.gguf"
+
+
+def test_template_source_classification():
+    from kaggle.config.model_config.manifest import TemplateSource
+    manifest = ModelCompatibilityManifest(
+        model_id="qwen38-27b",
+        gguf_source_repo="saitejavenkatavinay/ornith-qwen38-27b",
+        gguf_filename="Qwen3.8-27B-Q4_K_M.gguf",
+    )
+    assert manifest.chat_template_source == TemplateSource.UNVERIFIED
+
+    # Update with detected embedded template
+    manifest.record_gguf_metadata(
+        architecture="qwen3",
+        n_layers=65,
+        context_length=65536,
+        has_chat_template=True,
+        template_source=TemplateSource.EMBEDDED_GGUF,
+    )
+    assert manifest.chat_template_present is True
+    assert manifest.chat_template_source == TemplateSource.EMBEDDED_GGUF

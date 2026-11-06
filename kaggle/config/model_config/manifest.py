@@ -19,6 +19,13 @@ class CapabilityState(str, Enum):
     UNSUPPORTED = "UNSUPPORTED"
 
 
+class TemplateSource(str, Enum):
+    """Source classification of model chat template."""
+    EMBEDDED_GGUF = "EMBEDDED_GGUF_TEMPLATE"
+    RUNTIME_FALLBACK = "RUNTIME_BUILTIN_FALLBACK"
+    UNVERIFIED = "UNVERIFIED_TEMPLATE"
+
+
 @dataclass
 class ModelCapabilities:
     """Independent capability tracker for a deployed model."""
@@ -57,6 +64,7 @@ class ModelCompatibilityManifest:
     context_length: Optional[int] = None        # e.g., context_length from GGUF header
     chat_template_present: bool = True
     chat_template_flavor: str = "model_native_jinja"
+    chat_template_source: TemplateSource = TemplateSource.UNVERIFIED
 
     # Auxiliary tensor tracking (never blindly classified as harmless)
     auxiliary_layer_status: str = "UNVERIFIED_AUXILIARY_LAYER"
@@ -77,11 +85,15 @@ class ModelCompatibilityManifest:
         context_length: int,
         auxiliary_tensors: Optional[List[str]] = None,
         file_size_bytes: int = 0,
+        has_chat_template: bool = False,
+        template_source: TemplateSource = TemplateSource.UNVERIFIED,
     ) -> None:
         """Update manifest with live dynamically parsed GGUF metadata."""
         self.architecture = architecture
         self.n_layers = n_layers
         self.context_length = context_length
+        self.chat_template_present = has_chat_template
+        self.chat_template_source = template_source
         if file_size_bytes > 0:
             self.gguf_file_size_bytes = file_size_bytes
         if auxiliary_tensors:

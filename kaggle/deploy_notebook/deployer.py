@@ -205,6 +205,12 @@ if __name__ == "__main__":
         v_ok, v_res = verify_vision_pipeline(port=8080, model_alias=model.id)
         print(f"[{'OK' if v_ok else 'WARN'}] {v_res}", flush=True)
 
+    # 5.2 Chat Template Role & Tool Schema Formatting Verification
+    print("\\n[Phase 5.2] Verifying Chat Template message roles (system/user/assistant) & tool schemas...", flush=True)
+    t_ok, t_msg, t_roles = verify_chat_roles_and_tool_schema(port=8080, model_alias=model.id)
+    print(f"[{'OK' if t_ok else 'WARN'}] {t_msg}", flush=True)
+    print(f"  Role Verification Details: {t_roles}", flush=True)
+
     # 6. Start Authenticated Gateway (Port 4000) & Cloudflare Tunnel
     # Public Cloudflare -> Gateway (Port 4000 with Bearer Auth) -> llama-server (Port 8080)
     print("\\n[Phase 6] Starting Authenticated Gateway (Port 4000) & Cloudflare Tunnel...", flush=True)
