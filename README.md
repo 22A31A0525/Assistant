@@ -17,11 +17,12 @@ Assistant/
 ├── tests/                     # Unit test suites (pytest)
 │   ├── test_deploy_notebook.py
 │   ├── test_model_compatibility.py
-│   └── test_subtask3_memory_optimization.py
+│   ├── test_subtask3_memory_optimization.py
+│   └── test_subtask4_runtime.py
 └── kaggle/                    # Dedicated Kaggle remote GPU backend package
     ├── __init__.py
     ├── cli.py                 # Unified Kaggle Hub CLI (python -m kaggle.cli)
-    ├── chat.py                # Interactive streaming CLI client with remote GPU (85% context monitor)
+    ├── chat.py                # Interactive streaming CLI client with /think toggle & 85% context monitor
     ├── config/
     │   ├── auth_config/       # Multi-account credentials & active switcher
     │   │   ├── manager.py     # Account loader, synchronizer & validator
@@ -38,6 +39,9 @@ Assistant/
     │   ├── environment.py     # Strict 2x T4 check, CUDA 12 packages, & physical VRAM query
     │   ├── model_resolver.py  # Binary GGUF metadata parser & cautious tensor logging
     │   ├── gpu_allocator.py   # Subtask 3 hybrid 16/48 attention & DeltaNet state accounting
+    │   ├── latency_telemetry.py # Subtask 4 RequestClock & streaming TTFT latency instrumentation
+    │   ├── context_admission.py # Subtask 4 model-aware token admission guard & fail-closed validation
+    │   ├── runtime_policy.py  # Conservative CPU threading & microbatch flags policy
     │   ├── server_runner.py   # Single authoritative command builder, readiness probe, & role validation
     │   ├── auth_gateway.py    # Zero-dependency reverse proxy with Bearer auth & chunked SSE streaming
     │   ├── metadata.py        # Generates kernel-metadata.json with shared wheels
@@ -131,14 +135,44 @@ Qwen3.8-27B employs a hybrid attention structure:
 
 ---
 
+## ⚡ Subtask 4: CPU/RAM Coordination, Latency Telemetry & Model-Aware Context Guard
+
+### 1. Model-Aware Token Admission Guard (`context_admission.py` & `auth_gateway.py`)
+- Replaces naive character length approximations with exact model-level token validation via `llama-server`'s `/v1/chat/completions/input_tokens`.
+- Strictly enforces:
+  $$\text{Actual Input Tokens} + \text{Reserved Output Tokens} \le 65,536$$
+- Rejects oversized payloads with HTTP 400 (`CONTEXT_LENGTH_EXCEEDED`) and handles unreachable upstream counters with fail-closed HTTP 503 (`TOKEN_COUNT_UNAVAILABLE`).
+- Fast-paths raw inputs exceeding physical limits ($>250,000$ characters) to reject instantly without wasting GPU compute time.
+
+### 2. Latency Telemetry & True TTFT Clock (`latency_telemetry.py` & `chat.py`)
+- `RequestClock` measures user-observed completion wall time and streams Time-to-First-Token (**TTFT**) based strictly on the arrival of the first *content/tool_call delta* (not initial role headers).
+- Extracts native `prompt_per_second`, `predicted_per_second`, `prompt_ms`, and `predicted_ms` directly from `llama-server` chunks.
+- Resilient formatting handles missing/None timings gracefully without exceptions.
+
+### 3. CPU Thread Allocation & Hardware Pinning (`server_runner.py` & `runtime_policy.py`)
+- Evaluator decoding threads: `--threads 4` (matching Kaggle's 4 vCPU allocation without thread contention).
+- Prompt ingestion threads: `--threads-batch 4` (dedicated batch processing).
+- Preserves single dedicated slot (`--parallel 1`), microbatch size (`--ubatch-size 512`), and batch size (`--batch-size 2048`).
+- Keeps all 64 layers resident in Dual-T4 VRAM (`--n-gpu-layers 99`) with zero compute layers offloaded to CPU.
+
+### 4. Native Prompt-Prefix KV Cache Reuse
+- Verified in live multi-turn conversations: turn 2 reuses 35 of 53 tokens from prefix cache, minimizing re-tokenization overhead on follow-up turns.
+
+### 5. Explicit User Thinking Toggle (`/think on` / `/think off`)
+- Replaces hardcoded keyword heuristics with full user control in `chat.py`.
+- **Default: Thinking ON** (preserves deep Chain-of-Thought reasoning for complex coding, debugging, and analysis).
+- **Interactive Commands:** Type `/think off` for direct responses (~1.7s TTFT) or `/think on` to re-enable deep reasoning.
+
+---
+
 ## 🧪 Testing & Verification
 
 Run the full pytest suite:
 ```bash
 python -m pytest tests/ -v
 ```
-**Test Coverage (14/14 Passing):**
-- Native `llama-server` command flag generation (`--parallel 1`, `--no-reasoning-preserve`, `--flash-attn on`, `--ctx-size 65536`).
+**Test Coverage (27/27 Passing):**
+- Native `llama-server` command flag generation (`--parallel 1`, `--no-reasoning-preserve`, `--flash-attn on`, `--ctx-size 65536`, `--threads 4`, `--threads-batch 4`).
 - Hardware VRAM and system host RAM inspection fallbacks.
 - Bearer token security boundary & 401 gatekeeper.
 - Per-GPU memory allocation & mathematical layer distribution check.
@@ -147,3 +181,10 @@ python -m pytest tests/ -v
 - Exact hybrid 16/48 attention memory calculation (2,176.0 MiB at 64K).
 - Conservative DeltaNet recurrent state allowance (never zero).
 - Active 85% context threshold warning arithmetic.
+- Context admission boundary pass ($63,488$ tokens + $2,048$ output).
+- Context overflow rejection ($63,489$ tokens rejected).
+- Fail-closed token counter network and missing payload protection.
+- Native timing extraction and true content-token TTFT measurement.
+- Non-streaming TTFT handling (no false values fabricated).
+- Thread oversubscription rejection policy.
+- Command policy validation.
