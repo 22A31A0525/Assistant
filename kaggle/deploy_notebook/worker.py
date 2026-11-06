@@ -1958,23 +1958,35 @@ if __name__ == "__main__":
 
         # 6.4 Subtask 5: Verify Concurrent Single-Slot Overload Guard (HTTP 429 Retry-After)
         print("\n[Phase 6.2] Verifying Subtask 5 Single-Slot Scheduler Overload Guard...", flush=True)
-        # We simulate concurrent load against the gateway's SingleSlotScheduler
+        # Test concurrent queueing and 429 overload rejection using background thread
         acquire_ok_1, _ = GLOBAL_SCHEDULER.acquire("slot-test-holder")
         if acquire_ok_1:
             try:
-                # Slot is held: a concurrent POST to /v1/chat/completions must be queued or rejected with 429
-                # We test queue rejection by filling the queue of depth 1
-                acquire_ok_2, _ = GLOBAL_SCHEDULER.acquire("slot-test-queued")
+                queued_thread_res = []
+                def _queued_worker():
+                    queued_thread_res.append(GLOBAL_SCHEDULER.acquire("slot-test-queued"))
+
+                q_thread = threading.Thread(target=_queued_worker)
+                q_thread.start()
+                time.sleep(0.1)  # Let thread enter waiting queue
+
+                # Third concurrent caller attempts while queue is at capacity (max_queue=1) -> QUEUE_FULL immediately
                 acquire_ok_3, fail_reason = GLOBAL_SCHEDULER.acquire("slot-test-overflow")
                 if not acquire_ok_3 and fail_reason == "QUEUE_FULL":
-                    print("  [Single-Slot Scheduler Verified] Atomic queue capacity enforced: concurrent overflow rejected with QUEUE_FULL (HTTP 429).", flush=True)
+                    print("  [Single-Slot Scheduler Verified] Atomic queue capacity enforced: concurrent overflow rejected immediately with QUEUE_FULL (HTTP 429).", flush=True)
                 else:
                     print(f"  [Single-Slot Scheduler Note] Result: ok3={acquire_ok_3}, reason={fail_reason}", flush=True)
-                if acquire_ok_2:
-                    GLOBAL_SCHEDULER.release("slot-test-queued")
-            finally:
+
+                # Release holder -> queued worker should acquire
                 GLOBAL_SCHEDULER.release("slot-test-holder")
-                print("  [Single-Slot Scheduler Verified] Holder released: single-slot permit cleanly restored.", flush=True)
+                q_thread.join(timeout=2.0)
+                if queued_thread_res and queued_thread_res[0][0]:
+                    print("  [Single-Slot Scheduler Verified] Queued caller acquired slot cleanly upon holder completion.", flush=True)
+                    GLOBAL_SCHEDULER.release("slot-test-queued")
+                    print("  [Single-Slot Scheduler Verified] Queue drained and slot restored to idle.", flush=True)
+            except Exception as se:
+                GLOBAL_SCHEDULER.release("slot-test-holder")
+                print(f"  [Single-Slot Scheduler Exception] {se}", flush=True)
 
         # 6.5 Subtask 5: Verify Lossless Tool-Call Argument Transport
         print("\n[Phase 6.3] Verifying Subtask 5 Lossless Tool-Call Argument Transport...", flush=True)
