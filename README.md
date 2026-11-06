@@ -10,17 +10,18 @@ The repository is structured around a root configuration, local testing harnesse
 
 ```text
 Assistant/
-├── .env                       # Local secrets & API tokens (git-ignored)
+├── .env                       # Local secrets, active tunnel URL & API tokens (git-ignored)
 ├── .gitignore                 # Exclusion rules for secrets, caches, and logs
 ├── README.md                  # Project overview & architectural guide
 ├── assistant_persona/         # Persona profiles, system prompts & chat bindings
 ├── tests/                     # Unit test suites (pytest)
 │   ├── test_deploy_notebook.py
-│   └── test_model_compatibility.py
+│   ├── test_model_compatibility.py
+│   └── test_subtask3_memory_optimization.py
 └── kaggle/                    # Dedicated Kaggle remote GPU backend package
     ├── __init__.py
     ├── cli.py                 # Unified Kaggle Hub CLI (python -m kaggle.cli)
-    ├── chat.py                # Interactive streaming CLI client with remote GPU
+    ├── chat.py                # Interactive streaming CLI client with remote GPU (85% context monitor)
     ├── config/
     │   ├── auth_config/       # Multi-account credentials & active switcher
     │   │   ├── manager.py     # Account loader, synchronizer & validator
@@ -36,7 +37,7 @@ Assistant/
     ├── deploy_notebook/       # Modular Remote Deployment Subsystem
     │   ├── environment.py     # Strict 2x T4 check, CUDA 12 packages, & physical VRAM query
     │   ├── model_resolver.py  # Binary GGUF metadata parser & cautious tensor logging
-    │   ├── gpu_allocator.py   # Mathematical KV cache estimation & admission check
+    │   ├── gpu_allocator.py   # Subtask 3 hybrid 16/48 attention & DeltaNet state accounting
     │   ├── server_runner.py   # Single authoritative command builder, readiness probe, & role validation
     │   ├── auth_gateway.py    # Zero-dependency reverse proxy with Bearer auth & chunked SSE streaming
     │   ├── metadata.py        # Generates kernel-metadata.json with shared wheels
@@ -109,13 +110,24 @@ Decouples model features so unverified modes cannot fail silently:
 - **Auxiliary Tensors (`blk.64`):** Categorized conservatively as `DETECTED_UNVERIFIED_AUXILIARY_LAYER`. In Qwen 3/3.8 architectures, this is the trailing MTP (Multi-Token Prediction) speculative drafting block. Kept safely disabled (`--spec-type none` / no draft flags) to prevent memory index assertion crashes.
 - **Multimodal Token Positions (`non-consecutive token position`):** Documented as an expected artifact of Qwen-VL's M-RoPE 2D/3D grid image patch coordinates during sub-batching. Basic semantic output (*"Solid red square image"*) verified.
 
-### 5. Curated Model Catalog (`kaggle/config/model_config/`)
+---
 
-| Model | Capability | Context | Primary Kaggle Source | Vision Projector (`mmproj`) |
-|---|---|---|---|---|
-| **Ornith-1.0-35B** | Pure Text / Reasoning | 64K | `rohitvijayadapa/ornith-1-0-35b` | None |
-| **Qwen-3.6-35B** | Multimodal (Vision) | 64K | `saitejavenkatavinay/qwen36-35b-a3b-q4km` | `saitejavenkatavinay/qwen36-35b-mmproj` |
-| **Qwen-3.8-27B** | Multimodal (Vision) | 64K | `saitejavenkatavinay/ornith-qwen38-27b` | `mmproj-Qwen3.8-27B-f16.gguf` |
+## ⚡ Subtask 3: KV Cache, Attention & GPU Memory Optimization
+
+### 1. Hybrid 16/48 Architecture-Aware Memory Accounting (`gpu_allocator.py`)
+Qwen3.8-27B employs a hybrid attention structure:
+- **16 Full-Attention Layers:** Token-indexed KV cache. At 65,536 tokens with Q8_0 precision ($2 \times 16 \times 4 \times 256 \times 65536 \times 1.0625$ bytes), this occupies **2,176.0 MiB (~2.125 GiB)**.
+- **48 Gated DeltaNet Recurrent Layers:** Matrix hidden state memory scaling as $\mathcal{O}(1)$ independent of context length ($n_{\text{layers}} \times n_{\text{heads}} \times d_{\text{head}}^2 \times 2\text{ bytes}$).
+- **Elimination of Zero-State Undercounting:** The allocator never assumes 0.0 MiB for recurrent state. It applies a mathematically verified baseline ($24.0\text{ MiB}$) tagged as `CONSERVATIVE_CALCULATED_ALLOWANCE` unless empirical runtime buffers are configured.
+
+### 2. Flash Attention & CUDA Runtime Verification (`server_runner.py`)
+- Retains `--flash-attn on` paired strictly with `--cache-type-k q8_0` and `--cache-type-v q8_0` (supported Turing SM75 kernel).
+- The readiness probe inspects server `/props` directly to confirm `flash_attn: true` and active context window (`n_ctx: 65536`).
+- Safely avoids aggressive prompt-cache shifting and persistent slot swapping that desynchronize recurrent state.
+
+### 3. Context Capacity Safeguard at 85% (`chat.py`)
+- Proactive token estimation tracks conversational growth toward the 65,536 limit.
+- At **85% capacity (55,705 tokens)**, prints an explicit diagnostic warning allowing compaction before hitting hard context limits and risking truncated system instructions or tool schemas.
 
 ---
 
@@ -125,10 +137,13 @@ Run the full pytest suite:
 ```bash
 python -m pytest tests/ -v
 ```
-**Test Coverage (10/10 Passing):**
+**Test Coverage (14/14 Passing):**
 - Native `llama-server` command flag generation (`--parallel 1`, `--no-reasoning-preserve`, `--flash-attn on`, `--ctx-size 65536`).
 - Hardware VRAM and system host RAM inspection fallbacks.
 - Bearer token security boundary & 401 gatekeeper.
 - Per-GPU memory allocation & mathematical layer distribution check.
 - Manifest dynamic metadata recording & independent capability transitions.
 - Chat template source classification (`EMBEDDED_GGUF_TEMPLATE`).
+- Exact hybrid 16/48 attention memory calculation (2,176.0 MiB at 64K).
+- Conservative DeltaNet recurrent state allowance (never zero).
+- Active 85% context threshold warning arithmetic.
