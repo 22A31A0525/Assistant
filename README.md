@@ -46,7 +46,7 @@ Assistant/
 
 ---
 
-## 🚀 Features Implemented (Subtask 1)
+## 🚀 Features Implemented (Subtask 1: Dual-T4 Remote Infrastructure)
 
 ### 1. Unified Kaggle Control Center
 Run from the workspace root:
@@ -70,13 +70,24 @@ Operations available:
 - **Context Efficiency:** `--no-reasoning-preserve` strips intermediate reasoning history across conversational turns while preserving full native CoT reasoning during token generation.
 - **Flash Attention & Optimizations:** Uses `--flash-attn on`, `--batch-size 2048`, and `--ubatch-size 512`.
 
-### 3. Authenticated Gateway & Chunked SSE Streaming (`auth_gateway.py`)
+### 3. Authenticated Gateway, Chunked SSE Streaming & Health Safeguards (`auth_gateway.py`)
 - Reverse proxy running on port 4000 in front of `llama-server:8080`.
 - **Security:** Rejects unauthorized requests with `HTTP 401 Unauthorized` using Bearer authentication (`LITELLM_MASTER_KEY`).
 - **Real-Time Streaming:** Implements true HTTP/1.1 `Transfer-Encoding: chunked` for Server-Sent Events (`text/event-stream`), delivering real-time token streaming to local clients.
+- **Upstream Resilience:** Explicitly returns `503 Service Unavailable` with `Retry-After: 5` header when the underlying inference server is starting up or unreachable.
 - **Remote Shutdown Endpoint:** Exposes authenticated `POST /v1/shutdown` to allow remote self-termination (`os._exit(0)`), instantly terminating the remote GPU container.
 
-### 4. Curated Model Catalog (`kaggle/config/model_config/`)
+### 4. Hardware Verification & Resource Monitoring (`environment.py` & `gpu_allocator.py`)
+- **Strict Topology Check:** Requires exactly 2x NVIDIA Tesla T4 GPUs before proceeding.
+- **Per-GPU Memory Admission:** Mathematical allocation check verifying both GPU 0 and GPU 1 remain under their respective 14.0 GB safe limits (~1.8 GB safety headroom per card).
+- **Physical GPU VRAM Monitoring:** Post-startup `nvidia-smi` query reporting exact real-time VRAM allocation (`used_mib` / `total_mib`).
+- **Host CPU RAM Visibility:** Inspects `/proc/meminfo` at startup and readiness to track host memory, Linux page cache (`Buffers + Cached`), and swap pressure without external dependencies.
+
+### 5. Multimodal Vision Pipeline Verification (`server_runner.py`)
+- Embeds end-to-end multimodal validation with test image projection during startup.
+- Strictly validates whether the model generates real semantic content, reporting **Inconclusive** if the model exhausts tokens in reasoning without answering, preventing false-positive readiness claims.
+
+### 6. Curated Model Catalog (`kaggle/config/model_config/`)
 
 | Model | Capability | Context | Primary Kaggle Source | Vision Projector (`mmproj`) |
 |---|---|---|---|---|
@@ -92,4 +103,4 @@ Run the test suite locally:
 ```bash
 python -m pytest tests/test_deploy_notebook.py -v
 ```
-Verifies command line construction, single-slot enforcement, reasoning bypass flags, VRAM fallback handling, and gateway security boundaries.
+Verifies command line construction, single-slot enforcement, reasoning bypass flags, VRAM fallback handling, per-GPU admission distributions, system RAM structure, and gateway security boundaries.
