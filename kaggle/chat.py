@@ -38,6 +38,15 @@ def run_live_chat() -> None:
         {"role": "system", "content": "You are a helpful, fast, and intelligent AI coding assistant powered by Kaggle GPU."}
     ]
 
+    # Subtask 3: Context monitoring & 85% capacity threshold warning
+    MAX_CONTEXT_TOKENS = 65536
+    WARN_THRESHOLD_TOKENS = int(MAX_CONTEXT_TOKENS * 0.85)  # 55,705 tokens
+
+    def estimate_message_tokens(msgs: List[Dict[str, str]]) -> int:
+        # Approximate 1 token ~ 3.8 characters for code/text mix
+        total_chars = sum(len(m.get("content", "")) for m in msgs)
+        return int(total_chars / 3.8)
+
     while True:
         try:
             user_input = input("\nYou > ").strip()
@@ -52,6 +61,10 @@ def run_live_chat() -> None:
             break
 
         history.append({"role": "user", "content": user_input})
+
+        current_tokens_est = estimate_message_tokens(history)
+        if current_tokens_est >= WARN_THRESHOLD_TOKENS:
+            print(f"\n[Context Warning] Active conversation length (~{current_tokens_est:,} tokens) has reached 85% of 64K capacity ({MAX_CONTEXT_TOKENS:,}). Consider summarizing state.", flush=True)
 
         payload = json.dumps({
             "model": model_name,

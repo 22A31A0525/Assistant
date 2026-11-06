@@ -19,18 +19,60 @@ MAX_ALLOC_TARGET_MIB = 14336.0   # ~14.00 GiB (reserves ~1.8 GiB safety headroom
 SAFETY_HEADROOM_MIB = 1824.0     # ~1.8 GiB headroom
 
 
+def estimate_hybrid_memory_footprint(
+    context_tokens: int,
+    n_full_attn_layers: int = 16,
+    n_deltanet_layers: int = 48,
+    n_kv_heads: int = 4,
+    head_dim: int = 256,
+    cache_type: str = "q8_0",
+    deltanet_recurrent_mib: Optional[float] = None,
+) -> Tuple[float, float, float]:
+    """
+    Subtask 3: Architecture-aware hybrid memory estimator.
+    Distinguishes:
+    1. Token-indexed attention KV cache: Strictly for the full-attention layers (e.g. 16 layers).
+       Using Q8_0 (1.0625 bytes/elem): 2 * 16 * 4 * 256 * 65536 * 1.0625 = ~2,176 MiB (~2.125 GiB).
+    2. DeltaNet recurrent state: Configurable recurrent hidden-state buffer.
+       Defaults to 0.0 unless empirically reported/configured, rather than guessing.
+    
+    Returns:
+        (total_kv_and_state_mib, token_kv_cache_mib, deltanet_state_mib)
+    """
+    bytes_per_elem = 1.0625 if cache_type == "q8_0" else 2.0
+    # Full-attention token-indexed KV cache
+    token_kv_bytes = 2 * n_full_attn_layers * n_kv_heads * head_dim * context_tokens * bytes_per_elem
+    token_kv_cache_mib = token_kv_bytes / (1024 * 1024)
+
+    # Recurrent state memory (must remain configurable/empirical)
+    state_mib = deltanet_recurrent_mib if deltanet_recurrent_mib is not None else 0.0
+    total_mib = token_kv_cache_mib + state_mib
+
+    return total_mib, token_kv_cache_mib, state_mib
+
+
 def estimate_kv_cache_mib(
     context_tokens: int,
     n_layers: int = 64,
-    n_kv_heads: int = 8,
-    head_dim: int = 128,
+    n_kv_heads: int = 4,
+    head_dim: int = 256,
     cache_type: str = "q8_0",
 ) -> float:
     """
-    Accurately estimate total KV cache memory footprint using model-specific architecture params.
+    Backward-compatible estimator utilizing hybrid 16/48 architecture for Qwen3.8-27B.
     """
+    if n_layers == 64:
+        total, _, _ = estimate_hybrid_memory_footprint(
+            context_tokens=context_tokens,
+            n_full_attn_layers=16,
+            n_deltanet_layers=48,
+            n_kv_heads=n_kv_heads,
+            head_dim=head_dim,
+            cache_type=cache_type,
+        )
+        return total
+
     bytes_per_elem = 1.0625 if cache_type == "q8_0" else 2.0
-    # 2 buffers (K and V) * layers * heads * head_dim * context_tokens * bytes
     total_bytes = 2 * n_layers * n_kv_heads * head_dim * context_tokens * bytes_per_elem
     return total_bytes / (1024 * 1024)
 
@@ -55,13 +97,15 @@ def check_resource_admission(
     # Layer splitting distribution across GPUs
     layers_per_gpu = [math.ceil(n_layers / num_gpus) if i == 0 else math.floor(n_layers / num_gpus) for i in range(num_gpus)]
 
-    # Model-specific KV cache estimation
-    kv_cache_mib = estimate_kv_cache_mib(
+    # Model-specific hybrid KV cache estimation
+    kv_cache_mib, token_kv_mib, state_mib = estimate_hybrid_memory_footprint(
         context_tokens=target_context,
-        n_layers=n_layers,
-        n_kv_heads=getattr(profile, "n_kv_heads", 8),
-        head_dim=getattr(profile, "head_dim", 128),
+        n_full_attn_layers=16 if n_layers == 64 else n_layers,
+        n_deltanet_layers=48 if n_layers == 64 else 0,
+        n_kv_heads=getattr(profile, "n_kv_heads", 4),
+        head_dim=getattr(profile, "head_dim", 256),
         cache_type="q8_0",
+        deltanet_recurrent_mib=profile.extra_metadata.get("deltanet_recurrent_mib", None),
     )
     vision_buffer_mib = 1024.0 if has_vision_active else 0.0
     scratch_compute_mib = 1024.0
@@ -79,7 +123,9 @@ def check_resource_admission(
 
     breakdown = {
         "model_weights_mib": round(model_size_mib, 1),
-        "kv_cache_mib": round(kv_cache_mib, 1),
+        "total_kv_state_mib": round(kv_cache_mib, 1),
+        "token_kv_cache_mib": round(token_kv_mib, 1),
+        "deltanet_state_mib": round(state_mib, 1),
         "vision_buffer_mib": round(vision_buffer_mib, 1),
         "scratch_compute_mib": round(scratch_compute_mib, 1),
         "total_required_mib": round(total_required_mib, 1),
