@@ -145,8 +145,13 @@ if __name__ == "__main__":
     server_proc = subprocess.Popen(server_cmd)
 
     # 5. Readiness Verification Check
-    print("\\n[Phase 5] Verifying model initialization and VRAM readiness...", flush=True)
-    ready, r_msg = verify_server_readiness(port=8080, timeout_seconds=240, process=server_proc)
+    print("\\n[Phase 5] Verifying model initialization, process liveness, and VRAM readiness...", flush=True)
+    ready, r_msg, r_details = verify_server_readiness(
+        port=8080,
+        timeout_seconds=240,
+        process=server_proc,
+        expected_context=effective_ctx,
+    )
     print(f"[{'READY' if ready else 'FAILED'}] {r_msg}", flush=True)
     if not ready:
         print("[CRITICAL ERROR] Server failed readiness check. Terminating.", flush=True)
@@ -164,6 +169,19 @@ if __name__ == "__main__":
             print(f"  GPU {gpu['index']} ({gpu['name']}): {used_gb:.2f} GB used / {total_gb:.2f} GB total | Free Headroom: {free_gb:.2f} GB", flush=True)
     else:
         print("  [Note] Physical GPU stats query bypassed or nvidia-smi unavailable.", flush=True)
+
+    # System Host RAM & Swap pressure verification
+    print("\\n[Host Memory Verification] Checking system RAM, page cache, and swap pressure...", flush=True)
+    ram_stats = query_system_ram()
+    if ram_stats and ram_stats.get("total_gb", 0) > 0:
+        print(
+            f"  Host RAM: {ram_stats['used_gb']} GB used / {ram_stats['total_gb']} GB total "
+            f"(Available: {ram_stats['available_gb']} GB, Linux Page Cache: {ram_stats['cached_gb']} GB) | "
+            f"Swap Used: {ram_stats['swap_used_mb']} MB / {ram_stats['swap_total_mb']} MB",
+            flush=True,
+        )
+    else:
+        print("  [Note] Host RAM stats parsing bypassed (non-Linux environment).", flush=True)
 
     # 5.1 Vision Pipeline End-to-End Verification (if multimodal model)
     if has_vision:

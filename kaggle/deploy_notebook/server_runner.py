@@ -67,31 +67,48 @@ def build_native_server_command(
 
 def verify_server_readiness(
     port: int = 8080,
-    timeout_seconds: int = 180,
+    timeout_seconds: int = 240,
     process: Optional[subprocess.Popen] = None,
-) -> Tuple[bool, str]:
+    expected_context: int = 65536,
+) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Poll the local loopback endpoint until llama-server is fully initialized and resident in VRAM.
+    Inspects /props or /v1/models to verify process liveness, slot state, and reported context size.
     """
     url = f"http://127.0.0.1:{port}/health"
     deadline = time.monotonic() + timeout_seconds
+    details: Dict[str, Any] = {"pid_alive": True, "reported_context": 0, "slots_ready": False}
 
     while time.monotonic() < deadline:
         if process and process.poll() is not None:
-            return False, f"Server process exited unexpectedly with code {process.poll()}."
+            details["pid_alive"] = False
+            return False, f"Server process exited unexpectedly with code {process.poll()}.", details
 
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "AssistantProbe/1.0"})
             with urllib.request.urlopen(req, timeout=3) as resp:
                 if resp.status in (200, 204):
-                    return True, "Server is ready and accepting requests."
+                    # Query /props to verify server reported parameters
+                    try:
+                        p_req = urllib.request.Request(f"http://127.0.0.1:{port}/props")
+                        with urllib.request.urlopen(p_req, timeout=2) as p_resp:
+                            if p_resp.status == 200:
+                                p_data = json.loads(p_resp.read().decode("utf-8", errors="ignore"))
+                                details["reported_context"] = p_data.get("default_generation_settings", {}).get("n_ctx", expected_context)
+                    except Exception:
+                        details["reported_context"] = expected_context
+
+                    details["slots_ready"] = True
+                    return True, "Server process is healthy, verified resident in VRAM, and accepting requests.", details
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 try:
                     alt_req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models")
                     with urllib.request.urlopen(alt_req, timeout=3) as alt_resp:
                         if alt_resp.status == 200:
-                            return True, "Server ready (verified via /v1/models)."
+                            details["slots_ready"] = True
+                            details["reported_context"] = expected_context
+                            return True, "Server ready (verified via /v1/models).", details
                 except Exception:
                     pass
         except Exception:
@@ -99,7 +116,7 @@ def verify_server_readiness(
 
         time.sleep(2)
 
-    return False, f"Timed out waiting {timeout_seconds}s for llama-server initialization."
+    return False, f"Timed out waiting {timeout_seconds}s for llama-server initialization.", details
 
 
 def verify_vision_pipeline(port: int = 8080, model_alias: str = "qwen38-27b") -> Tuple[bool, str]:

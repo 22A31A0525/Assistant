@@ -104,10 +104,18 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(e_data)
         except Exception as e:
-            self.send_response(502)
+            # When llama-server backend is down, dead, or restarting -> Explicit 503 Service Unavailable
+            self.send_response(503)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", "5")
             self.end_headers()
-            err = json.dumps({"error": f"Gateway upstream error: {str(e)}"}).encode("utf-8")
+            err = json.dumps({
+                "error": {
+                    "code": "SERVICE_UNAVAILABLE",
+                    "message": f"Inference engine unavailable or initializing: {str(e)}",
+                    "layer": "auth_gateway"
+                }
+            }).encode("utf-8")
             self.wfile.write(err)
 
     def do_SHUTDOWN(self):

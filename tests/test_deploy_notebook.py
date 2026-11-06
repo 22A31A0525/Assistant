@@ -70,3 +70,31 @@ def test_auth_gateway_auth_enforcement():
     # Accept exact master key
     good = DummyHandler("Bearer sk-ant-api03-fakekey1234")
     assert good.check_auth() is True
+
+
+def test_per_gpu_admission_layer_distribution():
+    from kaggle.deploy_notebook.gpu_allocator import check_resource_admission
+    model = ModelCatalog.get_by_id("qwen38-27b")
+    
+    # 16.24 GB model weights across 2 GPUs at 64k context
+    admitted, eff_ctx, breakdown, msg = check_resource_admission(
+        model_size_gb=16.24,
+        profile=model,
+        target_context=65536,
+        num_gpus=2,
+        has_vision_active=True,
+    )
+    assert admitted is True
+    assert eff_ctx == 65536
+    # Both GPUs are evaluated against the per-card ~14 GB limit
+    assert breakdown["est_gpu0_mib"] <= breakdown["per_gpu_limit_mib"]
+    assert breakdown["est_gpu1_mib"] <= breakdown["per_gpu_limit_mib"]
+
+
+def test_system_ram_query_structure():
+    from kaggle.deploy_notebook.environment import query_system_ram
+    stats = query_system_ram()
+    assert isinstance(stats, dict)
+    assert "total_gb" in stats
+    assert "available_gb" in stats
+    assert "cached_gb" in stats

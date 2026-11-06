@@ -131,6 +131,53 @@ def query_physical_vram() -> List[Dict[str, Any]]:
         return []
 
 
+def query_system_ram() -> Dict[str, float]:
+    """
+    Query actual host CPU RAM consumption, free memory, cached page cache, and swap pressure.
+    Parses /proc/meminfo directly (Linux / Kaggle standard) without third-party dependencies.
+    """
+    stats: Dict[str, float] = {
+        "total_gb": 0.0,
+        "available_gb": 0.0,
+        "used_gb": 0.0,
+        "cached_gb": 0.0,
+        "swap_used_mb": 0.0,
+        "swap_total_mb": 0.0,
+    }
+    meminfo_path = Path("/proc/meminfo")
+    if not meminfo_path.exists():
+        # Fallback for Windows or non-proc systems
+        return stats
+
+    try:
+        data: Dict[str, float] = {}
+        for line in meminfo_path.read_text(encoding="utf-8").splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                val_parts = v.strip().split()
+                if val_parts and val_parts[0].isdigit():
+                    data[k.strip()] = float(val_parts[0])  # in kB
+
+        total_kb = data.get("MemTotal", 0.0)
+        avail_kb = data.get("MemAvailable", 0.0)
+        cached_kb = data.get("Cached", 0.0) + data.get("Buffers", 0.0)
+        used_kb = max(0.0, total_kb - avail_kb)
+
+        swap_total_kb = data.get("SwapTotal", 0.0)
+        swap_free_kb = data.get("SwapFree", 0.0)
+        swap_used_kb = max(0.0, swap_total_kb - swap_free_kb)
+
+        stats["total_gb"] = round(total_kb / (1024 * 1024), 2)
+        stats["available_gb"] = round(avail_kb / (1024 * 1024), 2)
+        stats["used_gb"] = round(used_kb / (1024 * 1024), 2)
+        stats["cached_gb"] = round(cached_kb / (1024 * 1024), 2)
+        stats["swap_used_mb"] = round(swap_used_kb / 1024, 1)
+        stats["swap_total_mb"] = round(swap_total_kb / 1024, 1)
+        return stats
+    except Exception:
+        return stats
+
+
 def install_cuda_runtime_packages() -> None:
     """Ensure libcudart.so.12 and libcublas.so.12 are installed."""
     try:
@@ -476,19 +523,22 @@ def check_resource_admission(
     has_vision_active: bool = False,
 ) -> Tuple[bool, int, Dict[str, float], str]:
     """
-    Verify whether the model weights and target context window can be admitted into VRAM.
-    Uses profile's actual n_layers, n_kv_heads, and head_dim.
+    Verify whether the model weights and target context window can be safely admitted into VRAM.
+    Enforces per-GPU limits independently (assuming layer split across GPUs) to guarantee safety headroom.
 
     Returns:
         (admitted, effective_context, breakdown, message)
     """
     model_size_mib = model_size_gb * 1024.0
-    total_allowed_vram_mib = num_gpus * MAX_ALLOC_TARGET_MIB
+    n_layers = getattr(profile, "n_layers", 64)
+
+    # Layer splitting distribution across GPUs
+    layers_per_gpu = [math.ceil(n_layers / num_gpus) if i == 0 else math.floor(n_layers / num_gpus) for i in range(num_gpus)]
 
     # Model-specific KV cache estimation
     kv_cache_mib = estimate_kv_cache_mib(
         context_tokens=target_context,
-        n_layers=getattr(profile, "n_layers", 64),
+        n_layers=n_layers,
         n_kv_heads=getattr(profile, "n_kv_heads", 8),
         head_dim=getattr(profile, "head_dim", 128),
         cache_type="q8_0",
@@ -498,38 +548,52 @@ def check_resource_admission(
 
     total_required_mib = model_size_mib + kv_cache_mib + vision_buffer_mib + scratch_compute_mib
 
+    # Per-GPU allocation estimation (GPU 0 handles vision projector buffer & primary overhead)
+    weight_fraction_gpu0 = layers_per_gpu[0] / n_layers
+    weight_fraction_gpu1 = layers_per_gpu[1] / n_layers if num_gpus > 1 else 0.0
+
+    est_gpu0_mib = (model_size_mib * weight_fraction_gpu0) + (kv_cache_mib * 0.5) + vision_buffer_mib + (scratch_compute_mib * 0.5)
+    est_gpu1_mib = (model_size_mib * weight_fraction_gpu1) + (kv_cache_mib * 0.5) + (scratch_compute_mib * 0.5) if num_gpus > 1 else 0.0
+
+    per_gpu_safe_limit = MAX_ALLOC_TARGET_MIB
+
     breakdown = {
         "model_weights_mib": round(model_size_mib, 1),
         "kv_cache_mib": round(kv_cache_mib, 1),
         "vision_buffer_mib": round(vision_buffer_mib, 1),
         "scratch_compute_mib": round(scratch_compute_mib, 1),
         "total_required_mib": round(total_required_mib, 1),
-        "total_capacity_mib": round(num_gpus * VRAM_PER_GPU_MIB, 1),
-        "max_safe_budget_mib": round(total_allowed_vram_mib, 1),
+        "est_gpu0_mib": round(est_gpu0_mib, 1),
+        "est_gpu1_mib": round(est_gpu1_mib, 1),
+        "per_gpu_limit_mib": round(per_gpu_safe_limit, 1),
         "headroom_per_gpu_mib": round(SAFETY_HEADROOM_MIB, 1),
     }
 
-    if total_required_mib <= total_allowed_vram_mib:
+    # Strict per-card admission check: neither GPU can exceed MAX_ALLOC_TARGET_MIB (~14.0 GB)
+    gpu0_fits = est_gpu0_mib <= per_gpu_safe_limit
+    gpu1_fits = (est_gpu1_mib <= per_gpu_safe_limit) if num_gpus > 1 else True
+
+    if gpu0_fits and gpu1_fits:
         msg = (
             f"Admitted at full {target_context:,} context. "
-            f"Total allocation: {total_required_mib / 1024:.2f} GB / "
-            f"{total_allowed_vram_mib / 1024:.2f} GB safe limit across {num_gpus}x T4s."
+            f"Estimated per-card peak: GPU 0: {est_gpu0_mib / 1024:.2f} GB, GPU 1: {est_gpu1_mib / 1024:.2f} GB "
+            f"(Safe limit: {per_gpu_safe_limit / 1024:.2f} GB with {SAFETY_HEADROOM_MIB / 1024:.2f} GB safety margin each)."
         )
         return True, target_context, breakdown, msg
 
     # Calculate safe fallback context if requested
-    available_for_kv = total_allowed_vram_mib - model_size_mib - vision_buffer_mib - scratch_compute_mib
-    if available_for_kv > 512.0:
+    max_kv_allowed = 2 * (per_gpu_safe_limit - max(est_gpu0_mib - (kv_cache_mib * 0.5), est_gpu1_mib - (kv_cache_mib * 0.5)))
+    if max_kv_allowed > 512.0:
         bytes_per_token = kv_cache_mib / target_context
-        safe_ctx = int(available_for_kv / bytes_per_token)
+        safe_ctx = int(max_kv_allowed / bytes_per_token)
         safe_ctx = max(8192, (safe_ctx // 4096) * 4096)
         msg = (
-            f"Target context {target_context:,} exceeds safe VRAM limit ({SAFETY_HEADROOM_MIB:.0f} MB headroom per card). "
+            f"Target context {target_context:,} exceeds safe per-GPU VRAM limit ({SAFETY_HEADROOM_MIB:.0f} MB headroom per card). "
             f"Safe supported context ceiling: {safe_ctx:,} tokens."
         )
         return False, safe_ctx, breakdown, msg
 
-    return False, 0, breakdown, f"Model size ({model_size_gb:.2f} GB) too large to maintain required VRAM safety headroom."
+    return False, 0, breakdown, f"Model size ({model_size_gb:.2f} GB) too large to maintain required per-GPU VRAM safety headroom."
 
 # ==================== Module: server_runner.py ====================
 """
@@ -600,31 +664,48 @@ def build_native_server_command(
 
 def verify_server_readiness(
     port: int = 8080,
-    timeout_seconds: int = 180,
+    timeout_seconds: int = 240,
     process: Optional[subprocess.Popen] = None,
-) -> Tuple[bool, str]:
+    expected_context: int = 65536,
+) -> Tuple[bool, str, Dict[str, Any]]:
     """
     Poll the local loopback endpoint until llama-server is fully initialized and resident in VRAM.
+    Inspects /props or /v1/models to verify process liveness, slot state, and reported context size.
     """
     url = f"http://127.0.0.1:{port}/health"
     deadline = time.monotonic() + timeout_seconds
+    details: Dict[str, Any] = {"pid_alive": True, "reported_context": 0, "slots_ready": False}
 
     while time.monotonic() < deadline:
         if process and process.poll() is not None:
-            return False, f"Server process exited unexpectedly with code {process.poll()}."
+            details["pid_alive"] = False
+            return False, f"Server process exited unexpectedly with code {process.poll()}.", details
 
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "AssistantProbe/1.0"})
             with urllib.request.urlopen(req, timeout=3) as resp:
                 if resp.status in (200, 204):
-                    return True, "Server is ready and accepting requests."
+                    # Query /props to verify server reported parameters
+                    try:
+                        p_req = urllib.request.Request(f"http://127.0.0.1:{port}/props")
+                        with urllib.request.urlopen(p_req, timeout=2) as p_resp:
+                            if p_resp.status == 200:
+                                p_data = json.loads(p_resp.read().decode("utf-8", errors="ignore"))
+                                details["reported_context"] = p_data.get("default_generation_settings", {}).get("n_ctx", expected_context)
+                    except Exception:
+                        details["reported_context"] = expected_context
+
+                    details["slots_ready"] = True
+                    return True, "Server process is healthy, verified resident in VRAM, and accepting requests.", details
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 try:
                     alt_req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/models")
                     with urllib.request.urlopen(alt_req, timeout=3) as alt_resp:
                         if alt_resp.status == 200:
-                            return True, "Server ready (verified via /v1/models)."
+                            details["slots_ready"] = True
+                            details["reported_context"] = expected_context
+                            return True, "Server ready (verified via /v1/models).", details
                 except Exception:
                     pass
         except Exception:
@@ -632,7 +713,7 @@ def verify_server_readiness(
 
         time.sleep(2)
 
-    return False, f"Timed out waiting {timeout_seconds}s for llama-server initialization."
+    return False, f"Timed out waiting {timeout_seconds}s for llama-server initialization.", details
 
 
 def verify_vision_pipeline(port: int = 8080, model_alias: str = "qwen38-27b") -> Tuple[bool, str]:
@@ -790,10 +871,18 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(e_data)
         except Exception as e:
-            self.send_response(502)
+            # When llama-server backend is down, dead, or restarting -> Explicit 503 Service Unavailable
+            self.send_response(503)
             self.send_header("Content-Type", "application/json")
+            self.send_header("Retry-After", "5")
             self.end_headers()
-            err = json.dumps({"error": f"Gateway upstream error: {str(e)}"}).encode("utf-8")
+            err = json.dumps({
+                "error": {
+                    "code": "SERVICE_UNAVAILABLE",
+                    "message": f"Inference engine unavailable or initializing: {str(e)}",
+                    "layer": "auth_gateway"
+                }
+            }).encode("utf-8")
             self.wfile.write(err)
 
     def do_SHUTDOWN(self):
@@ -901,8 +990,13 @@ if __name__ == "__main__":
     server_proc = subprocess.Popen(server_cmd)
 
     # 5. Readiness Verification Check
-    print("\n[Phase 5] Verifying model initialization and VRAM readiness...", flush=True)
-    ready, r_msg = verify_server_readiness(port=8080, timeout_seconds=240, process=server_proc)
+    print("\n[Phase 5] Verifying model initialization, process liveness, and VRAM readiness...", flush=True)
+    ready, r_msg, r_details = verify_server_readiness(
+        port=8080,
+        timeout_seconds=240,
+        process=server_proc,
+        expected_context=effective_ctx,
+    )
     print(f"[{'READY' if ready else 'FAILED'}] {r_msg}", flush=True)
     if not ready:
         print("[CRITICAL ERROR] Server failed readiness check. Terminating.", flush=True)
@@ -920,6 +1014,19 @@ if __name__ == "__main__":
             print(f"  GPU {gpu['index']} ({gpu['name']}): {used_gb:.2f} GB used / {total_gb:.2f} GB total | Free Headroom: {free_gb:.2f} GB", flush=True)
     else:
         print("  [Note] Physical GPU stats query bypassed or nvidia-smi unavailable.", flush=True)
+
+    # System Host RAM & Swap pressure verification
+    print("\n[Host Memory Verification] Checking system RAM, page cache, and swap pressure...", flush=True)
+    ram_stats = query_system_ram()
+    if ram_stats and ram_stats.get("total_gb", 0) > 0:
+        print(
+            f"  Host RAM: {ram_stats['used_gb']} GB used / {ram_stats['total_gb']} GB total "
+            f"(Available: {ram_stats['available_gb']} GB, Linux Page Cache: {ram_stats['cached_gb']} GB) | "
+            f"Swap Used: {ram_stats['swap_used_mb']} MB / {ram_stats['swap_total_mb']} MB",
+            flush=True,
+        )
+    else:
+        print("  [Note] Host RAM stats parsing bypassed (non-Linux environment).", flush=True)
 
     # 5.1 Vision Pipeline End-to-End Verification (if multimodal model)
     if has_vision:

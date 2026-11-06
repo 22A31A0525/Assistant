@@ -80,6 +80,53 @@ def query_physical_vram() -> List[Dict[str, Any]]:
         return []
 
 
+def query_system_ram() -> Dict[str, float]:
+    """
+    Query actual host CPU RAM consumption, free memory, cached page cache, and swap pressure.
+    Parses /proc/meminfo directly (Linux / Kaggle standard) without third-party dependencies.
+    """
+    stats: Dict[str, float] = {
+        "total_gb": 0.0,
+        "available_gb": 0.0,
+        "used_gb": 0.0,
+        "cached_gb": 0.0,
+        "swap_used_mb": 0.0,
+        "swap_total_mb": 0.0,
+    }
+    meminfo_path = Path("/proc/meminfo")
+    if not meminfo_path.exists():
+        # Fallback for Windows or non-proc systems
+        return stats
+
+    try:
+        data: Dict[str, float] = {}
+        for line in meminfo_path.read_text(encoding="utf-8").splitlines():
+            if ":" in line:
+                k, v = line.split(":", 1)
+                val_parts = v.strip().split()
+                if val_parts and val_parts[0].isdigit():
+                    data[k.strip()] = float(val_parts[0])  # in kB
+
+        total_kb = data.get("MemTotal", 0.0)
+        avail_kb = data.get("MemAvailable", 0.0)
+        cached_kb = data.get("Cached", 0.0) + data.get("Buffers", 0.0)
+        used_kb = max(0.0, total_kb - avail_kb)
+
+        swap_total_kb = data.get("SwapTotal", 0.0)
+        swap_free_kb = data.get("SwapFree", 0.0)
+        swap_used_kb = max(0.0, swap_total_kb - swap_free_kb)
+
+        stats["total_gb"] = round(total_kb / (1024 * 1024), 2)
+        stats["available_gb"] = round(avail_kb / (1024 * 1024), 2)
+        stats["used_gb"] = round(used_kb / (1024 * 1024), 2)
+        stats["cached_gb"] = round(cached_kb / (1024 * 1024), 2)
+        stats["swap_used_mb"] = round(swap_used_kb / 1024, 1)
+        stats["swap_total_mb"] = round(swap_total_kb / 1024, 1)
+        return stats
+    except Exception:
+        return stats
+
+
 def install_cuda_runtime_packages() -> None:
     """Ensure libcudart.so.12 and libcublas.so.12 are installed."""
     try:

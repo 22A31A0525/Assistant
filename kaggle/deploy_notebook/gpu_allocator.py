@@ -43,19 +43,22 @@ def check_resource_admission(
     has_vision_active: bool = False,
 ) -> Tuple[bool, int, Dict[str, float], str]:
     """
-    Verify whether the model weights and target context window can be admitted into VRAM.
-    Uses profile's actual n_layers, n_kv_heads, and head_dim.
+    Verify whether the model weights and target context window can be safely admitted into VRAM.
+    Enforces per-GPU limits independently (assuming layer split across GPUs) to guarantee safety headroom.
 
     Returns:
         (admitted, effective_context, breakdown, message)
     """
     model_size_mib = model_size_gb * 1024.0
-    total_allowed_vram_mib = num_gpus * MAX_ALLOC_TARGET_MIB
+    n_layers = getattr(profile, "n_layers", 64)
+
+    # Layer splitting distribution across GPUs
+    layers_per_gpu = [math.ceil(n_layers / num_gpus) if i == 0 else math.floor(n_layers / num_gpus) for i in range(num_gpus)]
 
     # Model-specific KV cache estimation
     kv_cache_mib = estimate_kv_cache_mib(
         context_tokens=target_context,
-        n_layers=getattr(profile, "n_layers", 64),
+        n_layers=n_layers,
         n_kv_heads=getattr(profile, "n_kv_heads", 8),
         head_dim=getattr(profile, "head_dim", 128),
         cache_type="q8_0",
@@ -65,35 +68,49 @@ def check_resource_admission(
 
     total_required_mib = model_size_mib + kv_cache_mib + vision_buffer_mib + scratch_compute_mib
 
+    # Per-GPU allocation estimation (GPU 0 handles vision projector buffer & primary overhead)
+    weight_fraction_gpu0 = layers_per_gpu[0] / n_layers
+    weight_fraction_gpu1 = layers_per_gpu[1] / n_layers if num_gpus > 1 else 0.0
+
+    est_gpu0_mib = (model_size_mib * weight_fraction_gpu0) + (kv_cache_mib * 0.5) + vision_buffer_mib + (scratch_compute_mib * 0.5)
+    est_gpu1_mib = (model_size_mib * weight_fraction_gpu1) + (kv_cache_mib * 0.5) + (scratch_compute_mib * 0.5) if num_gpus > 1 else 0.0
+
+    per_gpu_safe_limit = MAX_ALLOC_TARGET_MIB
+
     breakdown = {
         "model_weights_mib": round(model_size_mib, 1),
         "kv_cache_mib": round(kv_cache_mib, 1),
         "vision_buffer_mib": round(vision_buffer_mib, 1),
         "scratch_compute_mib": round(scratch_compute_mib, 1),
         "total_required_mib": round(total_required_mib, 1),
-        "total_capacity_mib": round(num_gpus * VRAM_PER_GPU_MIB, 1),
-        "max_safe_budget_mib": round(total_allowed_vram_mib, 1),
+        "est_gpu0_mib": round(est_gpu0_mib, 1),
+        "est_gpu1_mib": round(est_gpu1_mib, 1),
+        "per_gpu_limit_mib": round(per_gpu_safe_limit, 1),
         "headroom_per_gpu_mib": round(SAFETY_HEADROOM_MIB, 1),
     }
 
-    if total_required_mib <= total_allowed_vram_mib:
+    # Strict per-card admission check: neither GPU can exceed MAX_ALLOC_TARGET_MIB (~14.0 GB)
+    gpu0_fits = est_gpu0_mib <= per_gpu_safe_limit
+    gpu1_fits = (est_gpu1_mib <= per_gpu_safe_limit) if num_gpus > 1 else True
+
+    if gpu0_fits and gpu1_fits:
         msg = (
             f"Admitted at full {target_context:,} context. "
-            f"Total allocation: {total_required_mib / 1024:.2f} GB / "
-            f"{total_allowed_vram_mib / 1024:.2f} GB safe limit across {num_gpus}x T4s."
+            f"Estimated per-card peak: GPU 0: {est_gpu0_mib / 1024:.2f} GB, GPU 1: {est_gpu1_mib / 1024:.2f} GB "
+            f"(Safe limit: {per_gpu_safe_limit / 1024:.2f} GB with {SAFETY_HEADROOM_MIB / 1024:.2f} GB safety margin each)."
         )
         return True, target_context, breakdown, msg
 
     # Calculate safe fallback context if requested
-    available_for_kv = total_allowed_vram_mib - model_size_mib - vision_buffer_mib - scratch_compute_mib
-    if available_for_kv > 512.0:
+    max_kv_allowed = 2 * (per_gpu_safe_limit - max(est_gpu0_mib - (kv_cache_mib * 0.5), est_gpu1_mib - (kv_cache_mib * 0.5)))
+    if max_kv_allowed > 512.0:
         bytes_per_token = kv_cache_mib / target_context
-        safe_ctx = int(available_for_kv / bytes_per_token)
+        safe_ctx = int(max_kv_allowed / bytes_per_token)
         safe_ctx = max(8192, (safe_ctx // 4096) * 4096)
         msg = (
-            f"Target context {target_context:,} exceeds safe VRAM limit ({SAFETY_HEADROOM_MIB:.0f} MB headroom per card). "
+            f"Target context {target_context:,} exceeds safe per-GPU VRAM limit ({SAFETY_HEADROOM_MIB:.0f} MB headroom per card). "
             f"Safe supported context ceiling: {safe_ctx:,} tokens."
         )
         return False, safe_ctx, breakdown, msg
 
-    return False, 0, breakdown, f"Model size ({model_size_gb:.2f} GB) too large to maintain required VRAM safety headroom."
+    return False, 0, breakdown, f"Model size ({model_size_gb:.2f} GB) too large to maintain required per-GPU VRAM safety headroom."
