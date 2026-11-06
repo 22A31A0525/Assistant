@@ -4,54 +4,56 @@ A modular, self-hosted AI Assistant architecture powered by remote GPU inference
 
 ---
 
-## 📌 Current Project Status
+## 📌 Project Architecture
 
-The workspace has been initialized freshly with a clean layout and Git version control:
-
-- **Root Environment**: Clean `.env` holding multi-account Kaggle credentials and tunnel configurations (protected via `.gitignore`).
-- **Git Repository**: Initialized with secrets excluded from version control.
-- **Kaggle Subsystem (`kaggle/`)**: Dedicated backend package folder structure established for remote LLM hosting.
-
----
-
-## 🗂️ Project Directory Structure
+The repository is structured around a root configuration and a clean, isolated `kaggle/` backend subsystem:
 
 ```text
 Assistant/
-├── .env                       # Local secrets & API configurations (git-ignored)
-├── .gitignore                 # Version control exclusion rules
-├── README.md                  # Project overview & progress tracking
+├── .env                       # Local secrets & API tokens (git-ignored)
+├── .gitignore                 # Exclusion rules for secrets, caches, and logs
+├── README.md                  # Project overview & architectural guide
 ├── logs/                      # Runtime operational logs
 ├── assistant_persona/         # Persona profiles, system prompts & chat bindings
 └── kaggle/                    # Dedicated Kaggle remote GPU backend package
     ├── __init__.py
-    ├── config/
-    │   ├── auth_config/       # Multi-account credentials & switcher logic
-    │   ├── model_config/      # Model catalogs, quantization & VRAM profiles
-    │   └── api_end_point_config/ # llama.cpp runtime flags & tunnel configuration
-    ├── deploy_notebook/       # Kernel deployment templates & deployer CLI
-    └── tracker/               # Kernel status monitor, log streamer & GPU stopper
+    ├── cli.py                 # Unified Kaggle Hub CLI (python -m kaggle.cli)
+    └── config/
+        ├── auth_config/       # Multi-account credentials & active switcher
+        │   ├── __init__.py
+        │   ├── manager.py     # Account loader, synchronizer & validator
+        │   └── models.py      # Account data models & slug generator
+        ├── model_config/      # Curated 3-model catalog & hardware profiles
+        │   ├── __init__.py
+        │   ├── catalog.py     # Registry with fixed owner datasets & vision mmproj
+        │   ├── common.py      # Shared CUDA 12 & runtime wheel datasets
+        │   └── profile.py     # ModelProfile dataclass (text & multimodal)
+        └── api_end_point_config/ # llama.cpp runtime flags & tunnel configuration
 ```
 
 ---
 
-## 🚀 What's Configured So Far
+## 🚀 Features Implemented
 
-1. **Multi-Account Kaggle Authentication**
-   - Configured in `.env` with primary and backup accounts.
-   - Live connectivity verified via Kaggle CLI (`kaggle kernels list --mine`).
+### 1. Unified Kaggle Control Center
+A single, centralized CLI to manage all remote GPU operations:
+```bash
+python -m kaggle.cli
+```
 
-2. **Remote Host & Tunneling Blueprint**
-   - Supports Cloudflare and Ngrok tunneling to expose remote `llama.cpp` server instances running on Kaggle GPUs (T4 / P100).
+### 2. Multi-Account Authentication Manager (`kaggle/config/auth_config/`)
+- Dynamically parses active and registered accounts from `.env`.
+- Safely synchronizes credentials to `~/.kaggle/kaggle.json` and `.env`.
+- Cleans conflicting OAuth tokens to prevent CLI account lockups.
+- Direct connectivity verification with Kaggle API.
 
-3. **Workspace Isolation**
-   - The Kaggle subsystem is organized as a stand-alone Python package (`kaggle/`), ensuring clean separation from the local assistant's persona and logic.
+### 3. Curated Model Catalog (`kaggle/config/model_config/`)
+Configured specifically for Dual Tesla T4 GPUs (`LAYER` split mode) with exact Kaggle source mappings:
 
----
+| Model | Capability | Primary Source / Dataset | Vision Projector (`mmproj`) |
+|---|---|---|---|
+| **Ornith-1.0-35B** | Pure Text / Reasoning | `rohitvijayadapa/ornith-1-0-35b` | None |
+| **Qwen-3.6-35B** | Multimodal (Vision) | `saitejavenkatavinay/qwen36-35b-a3b-q4km` | `saitejavenkatavinay/qwen36-35b-mmproj` |
+| **Qwen-3.8-27B** | Multimodal (Vision) | `saitejavenkatavinay/ornith-qwen38-27b` | `saitejavenkatavinay/qwen36-35b-mmproj` |
 
-## 📋 Next Steps
-
-- [ ] **Step 1**: Migrate and optimize the authentication module (`kaggle/config/auth_config/`).
-- [ ] **Step 2**: Implement the model catalog and VRAM hardware profiler (`kaggle/config/model_config/`).
-- [ ] **Step 3**: Set up kernel deployment scripts and log streamer/GPU stopper (`kaggle/deploy_notebook/`, `kaggle/tracker/`).
-- [ ] **Step 4**: Design the Assistant Persona module (`assistant_persona/`) to bind client interactions to the remote endpoint.
+All models automatically link shared runtime dependencies (`rohitvijayadapa/ornith-runtime-wheels` & `rohitvijayadapa/ornith-runtime-cuda12-sm75`).
