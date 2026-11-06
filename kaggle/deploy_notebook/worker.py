@@ -1661,6 +1661,46 @@ if __name__ == "__main__":
     print(f"[{'OK' if t_ok else 'WARN'}] {t_msg}", flush=True)
     print(f"  Role Verification Details: {t_roles}", flush=True)
 
+    # 5.3 Subtask 4 Telemetry & Gateway Model-Aware Context Guard Probe
+    print("\n[Phase 5.3] Testing Subtask 4 Telemetry & Model-Aware Gateway Context Guard...", flush=True)
+    try:
+        from time import perf_counter
+        probe_clock = RequestClock(started_at=perf_counter())
+        probe_payload = {
+            "model": model.id,
+            "messages": [{"role": "user", "content": "Latency and context admission probe. Reply 'OK'."}],
+            "max_tokens": 16,
+        }
+        # 1. Test Gateway Context Admission directly against local llama-server token counter
+        adm_res = validate_before_proxy(
+            probe_payload,
+            counter=lambda p: count_using_local_llama_server(p, url="http://127.0.0.1:8080/v1/chat/completions/input_tokens", timeout=5.0),
+            context_limit=effective_ctx,
+            output_cap=2048,
+        )
+        print(f"  [Context Guard Verified] Input tokens: {adm_res.input_tokens} | Reserved output: {adm_res.reserved_output_tokens} | Context ceiling: {adm_res.context_limit} | Remaining capacity: {adm_res.remaining_tokens}", flush=True)
+
+        # 2. Test Stream Chunk Latency Telemetry
+        probe_req = urllib.request.Request(
+            "http://127.0.0.1:8080/v1/chat/completions",
+            data=json.dumps({**probe_payload, "stream": True}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(probe_req, timeout=15) as s_resp:
+            for s_line in s_resp:
+                s_decoded = s_line.decode("utf-8", errors="ignore").strip()
+                if s_decoded.startswith("data: ") and s_decoded != "data: [DONE]":
+                    try:
+                        probe_clock.observe_chunk(json.loads(s_decoded[6:]))
+                    except Exception:
+                        pass
+        probe_clock.finish()
+        c_res = probe_clock.result()
+        print(f"  [Latency Telemetry Verified] TTFT (first content): {c_res.get('ttft_ms', 0):.1f}ms | Total Wall Time: {c_res.get('total_ms', 0):.1f}ms | Native timings: {c_res}", flush=True)
+    except Exception as e:
+        print(f"  [Phase 5.3 Note] Gateway probe check warning: {e}", flush=True)
+
     # 6. Start Authenticated Gateway (Port 4000) & Cloudflare Tunnel
     # Public Cloudflare -> Gateway (Port 4000 with Bearer Auth) -> llama-server (Port 8080)
     print("\n[Phase 6] Starting Authenticated Gateway (Port 4000) & Cloudflare Tunnel...", flush=True)
