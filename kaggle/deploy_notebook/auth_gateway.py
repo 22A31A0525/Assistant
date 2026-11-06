@@ -18,10 +18,13 @@ from typing import Optional
 
 
 class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
-    """Simple, zero-dependency HTTP reverse proxy with Bearer auth verification."""
+    """Simple, zero-dependency HTTP reverse proxy with Bearer auth and context admission guard."""
 
     master_key: str = "sk-ant-api03-fakekey1234"
     upstream_port: int = 8080
+    max_context_tokens: int = 65536
+    # Reserve tokens for output generation (2048) + safety buffer -> max prompt tokens ~62,000
+    max_prompt_tokens: int = 62000
 
     def log_message(self, format, *args):
         # Suppress noisy standard request logging
@@ -46,6 +49,49 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(err)
         return False
 
+    def validate_context_limits(self, body: Optional[bytes]) -> Tuple[bool, Optional[str]]:
+        """
+        Subtask 3 Hard Safeguard: Prevent requests exceeding maximum context window (65,536).
+        Calculates approximate prompt tokens and verifies against max_prompt_tokens ceiling.
+        """
+        if not body or not self.path.startswith("/v1/chat/completions"):
+            return True, None
+
+        try:
+            payload = json.loads(body.decode("utf-8", errors="ignore"))
+            messages = payload.get("messages", [])
+            max_tokens = payload.get("max_tokens", 2048) or 2048
+            
+            # Approximate token length: text characters / 3.8 + image base64 patch allowance
+            total_chars = 0
+            image_token_allowance = 0
+            for msg in messages:
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    total_chars += len(content)
+                elif isinstance(content, list):
+                    for part in content:
+                        if isinstance(part, dict):
+                            if part.get("type") == "text":
+                                total_chars += len(part.get("text", ""))
+                            elif part.get("type") == "image_url":
+                                # Qwen-VL allocates standard patch grid (~1024 tokens minimum)
+                                image_token_allowance += 1024
+
+            estimated_prompt_tokens = int(total_chars / 3.8) + image_token_allowance
+            ceiling = self.max_context_tokens - max_tokens
+
+            if estimated_prompt_tokens > ceiling:
+                return False, (
+                    f"Request prompt size (~{estimated_prompt_tokens:,} tokens) plus requested generation "
+                    f"({max_tokens:,} tokens) exceeds maximum context capacity ({self.max_context_tokens:,}). "
+                    f"Safe prompt limit is {ceiling:,} tokens."
+                )
+            return True, None
+        except Exception:
+            # If body is not standard JSON, allow upstream to parse or reject
+            return True, None
+
     def do_GET(self):
         if not self.check_auth():
             return
@@ -63,6 +109,22 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
         target_url = f"http://127.0.0.1:{self.upstream_port}{self.path}"
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
+
+        # Hard Context Limit Check (Subtask 3 Safeguard)
+        valid_context, err_msg = self.validate_context_limits(body)
+        if not valid_context:
+            self.send_response(400)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            err_resp = json.dumps({
+                "error": {
+                    "code": "CONTEXT_LENGTH_EXCEEDED",
+                    "message": err_msg,
+                    "layer": "auth_gateway",
+                }
+            }).encode("utf-8")
+            self.wfile.write(err_resp)
+            return
 
         req_headers = {k: v for k, v in self.headers.items() if k.lower() not in ("host", "authorization")}
 

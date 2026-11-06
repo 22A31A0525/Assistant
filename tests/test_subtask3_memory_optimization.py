@@ -72,3 +72,32 @@ def test_chat_context_warning_threshold():
     max_ctx = 65536
     warn_thresh = int(max_ctx * 0.85)
     assert warn_thresh == 55705
+
+
+def test_auth_gateway_hard_context_overflow_rejection():
+    from kaggle.deploy_notebook.auth_gateway import AuthenticatedGatewayHandler
+    import json
+
+    handler = AuthenticatedGatewayHandler.__new__(AuthenticatedGatewayHandler)
+    handler.path = "/v1/chat/completions"
+    handler.max_context_tokens = 65536
+
+    # Normal sized request (fits well within context window)
+    normal_payload = json.dumps({
+        "messages": [{"role": "user", "content": "Hello, write a simple function."}],
+        "max_tokens": 1024,
+    }).encode("utf-8")
+    valid, err = handler.validate_context_limits(normal_payload)
+    assert valid is True
+    assert err is None
+
+    # Oversized payload exceeding max context window (e.g. 260,000 characters ~ 68,000 tokens)
+    huge_prompt = "x" * 260000
+    huge_payload = json.dumps({
+        "messages": [{"role": "user", "content": huge_prompt}],
+        "max_tokens": 2048,
+    }).encode("utf-8")
+    valid, err = handler.validate_context_limits(huge_payload)
+    assert valid is False
+    assert err is not None
+    assert "exceeds maximum context capacity" in err
