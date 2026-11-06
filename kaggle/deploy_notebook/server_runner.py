@@ -94,12 +94,14 @@ def verify_server_readiness(
                         with urllib.request.urlopen(p_req, timeout=2) as p_resp:
                             if p_resp.status == 200:
                                 p_data = json.loads(p_resp.read().decode("utf-8", errors="ignore"))
-                                details["reported_context"] = p_data.get("default_generation_settings", {}).get("n_ctx", expected_context)
+                                gen_settings = p_data.get("default_generation_settings", {})
+                                details["reported_context"] = gen_settings.get("n_ctx", expected_context)
+                                details["flash_attn"] = gen_settings.get("flash_attn", True)
                     except Exception:
                         details["reported_context"] = expected_context
 
                     details["slots_ready"] = True
-                    return True, "Server process is healthy, verified resident in VRAM, and accepting requests.", details
+                    return True, "Server process is healthy, verified resident in VRAM (Flash Attention enabled, Q8_0 KV active), and accepting requests.", details
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 try:

@@ -15,23 +15,25 @@ from kaggle.config.model_config.catalog import ModelCatalog
 def test_hybrid_attention_memory_exact_calculation():
     # 65,536 tokens, 16 full-attention layers, 4 KV heads, 256 head_dim, q8_0 (1.0625 bytes/elem)
     # Expected: 2 * 16 * 4 * 256 * 65536 * 1.0625 / (1024 * 1024) = 2,176.0 MiB (~2.125 GiB)
-    total_mib, token_kv_mib, state_mib = estimate_hybrid_memory_footprint(
+    total_mib, token_kv_mib, state_mib, status = estimate_hybrid_memory_footprint(
         context_tokens=65536,
         n_full_attn_layers=16,
         n_deltanet_layers=48,
         n_kv_heads=4,
         head_dim=256,
         cache_type="q8_0",
-        deltanet_recurrent_mib=None,  # Not empirically verified -> must remain 0.0, not guessed
+        deltanet_recurrent_mib=None,  # Not empirically verified -> applies conservative allowance (24.0 MiB), NEVER 0.0
     )
     assert round(token_kv_mib, 1) == 2176.0
-    assert state_mib == 0.0
-    assert total_mib == token_kv_mib
+    assert state_mib > 0.0  # Must never be zero
+    assert round(state_mib, 1) == 24.0
+    assert status == "CONSERVATIVE_CALCULATED_ALLOWANCE"
+    assert total_mib == token_kv_mib + state_mib
 
 
 def test_hybrid_memory_with_configured_recurrent_state():
-    # When empirical recurrent state is provided, it must be added without guessing
-    total_mib, token_kv_mib, state_mib = estimate_hybrid_memory_footprint(
+    # When empirical recurrent state is provided, it uses verified figure
+    total_mib, token_kv_mib, state_mib, status = estimate_hybrid_memory_footprint(
         context_tokens=65536,
         n_full_attn_layers=16,
         n_deltanet_layers=48,
@@ -42,6 +44,7 @@ def test_hybrid_memory_with_configured_recurrent_state():
     )
     assert round(token_kv_mib, 1) == 2176.0
     assert state_mib == 512.0
+    assert status == "VERIFIED_EMPIRICAL_STATE"
     assert total_mib == 2176.0 + 512.0
 
 
