@@ -32,12 +32,16 @@ def run_live_chat() -> None:
     print("=" * 60)
     print(f"  • Endpoint : {url}")
     print(f"  • Host     : Kaggle Dual Tesla T4")
-    print("  Type 'exit' or 'quit' to return to menu.")
+    print("  Commands   : '/think on' | '/think off' to toggle reasoning mode.")
+    print("               'exit' or 'quit' to return to menu.")
     print("=" * 60 + "\n")
 
     history: List[Dict[str, str]] = [
         {"role": "system", "content": "You are a helpful, fast, and intelligent AI coding assistant powered by Kaggle GPU."}
     ]
+
+    # User-controlled thinking toggle (Default: ON for full reasoning and coding capability)
+    user_thinking_enabled: bool = True
 
     # Subtask 3: Context monitoring & 85% capacity threshold warning
     MAX_CONTEXT_TOKENS = 65536
@@ -48,21 +52,10 @@ def run_live_chat() -> None:
         total_chars = sum(len(m.get("content", "")) for m in msgs)
         return int(total_chars / 3.8)
 
-    # Mode-aware thinking control: enable deep CoT for complex prompts, direct response for casual
-    THINKING_PROMPT_KEYWORDS = (
-        "debug", "fix", "solve", "why", "architect", "explain", "analyze", "refactor",
-        "implement", "optimize", "algorithm", "complex", "plan", "reason"
-    )
-
-    def should_enable_deep_reasoning(text: str) -> bool:
-        lower = text.lower()
-        if len(text.split()) > 15:
-            return True
-        return any(kw in lower for kw in THINKING_PROMPT_KEYWORDS)
-
     while True:
         try:
-            user_input = input("\nYou > ").strip()
+            status_indicator = "ON" if user_thinking_enabled else "OFF"
+            user_input = input(f"\nYou [Thinking: {status_indicator}] > ").strip()
         except (KeyboardInterrupt, EOFError):
             print("\nExiting chat...")
             break
@@ -73,13 +66,21 @@ def run_live_chat() -> None:
             print("Ending chat session.")
             break
 
+        # Explicit user commands to toggle reasoning on/off
+        if user_input.lower() in ("/think on", "think on", "/cot on"):
+            user_thinking_enabled = True
+            print("[Reasoning Mode] Thinking enabled (Full Chain-of-Thought active for complex coding).")
+            continue
+        elif user_input.lower() in ("/think off", "think off", "/cot off"):
+            user_thinking_enabled = False
+            print("[Reasoning Mode] Thinking disabled (Direct fast responses active, ~1.5s TTFT).")
+            continue
+
         history.append({"role": "user", "content": user_input})
 
         current_tokens_est = estimate_message_tokens(history)
         if current_tokens_est >= WARN_THRESHOLD_TOKENS:
             print(f"\n[Context Warning] Active conversation length (~{current_tokens_est:,} tokens) has reached 85% of 64K capacity ({MAX_CONTEXT_TOKENS:,}). Consider summarizing state.", flush=True)
-
-        enable_cot = should_enable_deep_reasoning(user_input)
 
         req_body = {
             "model": model_name,
@@ -88,8 +89,8 @@ def run_live_chat() -> None:
             "max_tokens": 2048,
             "stream": True,
         }
-        if not enable_cot:
-            # Bypass reasoning overhead for simple/conversational prompts
+        if not user_thinking_enabled:
+            # Bypass reasoning overhead when user turns thinking off
             req_body["chat_template_kwargs"] = {"enable_thinking": False}
 
         payload = json.dumps(req_body).encode("utf-8")
