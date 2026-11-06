@@ -48,6 +48,18 @@ def run_live_chat() -> None:
         total_chars = sum(len(m.get("content", "")) for m in msgs)
         return int(total_chars / 3.8)
 
+    # Mode-aware thinking control: enable deep CoT for complex prompts, direct response for casual
+    THINKING_PROMPT_KEYWORDS = (
+        "debug", "fix", "solve", "why", "architect", "explain", "analyze", "refactor",
+        "implement", "optimize", "algorithm", "complex", "plan", "reason"
+    )
+
+    def should_enable_deep_reasoning(text: str) -> bool:
+        lower = text.lower()
+        if len(text.split()) > 15:
+            return True
+        return any(kw in lower for kw in THINKING_PROMPT_KEYWORDS)
+
     while True:
         try:
             user_input = input("\nYou > ").strip()
@@ -67,13 +79,20 @@ def run_live_chat() -> None:
         if current_tokens_est >= WARN_THRESHOLD_TOKENS:
             print(f"\n[Context Warning] Active conversation length (~{current_tokens_est:,} tokens) has reached 85% of 64K capacity ({MAX_CONTEXT_TOKENS:,}). Consider summarizing state.", flush=True)
 
-        payload = json.dumps({
+        enable_cot = should_enable_deep_reasoning(user_input)
+
+        req_body = {
             "model": model_name,
             "messages": history,
             "temperature": 0.7,
             "max_tokens": 2048,
             "stream": True,
-        }).encode("utf-8")
+        }
+        if not enable_cot:
+            # Bypass reasoning overhead for simple/conversational prompts
+            req_body["chat_template_kwargs"] = {"enable_thinking": False}
+
+        payload = json.dumps(req_body).encode("utf-8")
 
         headers = {
             "Content-Type": "application/json",
