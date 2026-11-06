@@ -892,6 +892,27 @@ def extract_timings(response: Mapping[str, Any]) -> dict[str, float | int]:
     return result
 
 
+def format_telemetry_summary(clock_result: Mapping[str, Any]) -> str:
+    """Safely format clock results handling missing or NoneType values without formatting exceptions."""
+    ttft = clock_result.get("ttft_ms")
+    ttft_str = f"{ttft:.1f}ms" if isinstance(ttft, (int, float)) else "N/A (no content delta)"
+
+    total = clock_result.get("total_ms")
+    total_str = f"{total:.1f}ms" if isinstance(total, (int, float)) else "N/A"
+
+    parts = [f"TTFT: {ttft_str}", f"Total: {total_str}"]
+
+    prompt_speed = clock_result.get("prompt_per_second")
+    if isinstance(prompt_speed, (int, float)):
+        parts.append(f"Prompt: {prompt_speed:.1f} t/s")
+
+    gen_speed = clock_result.get("predicted_per_second")
+    if isinstance(gen_speed, (int, float)):
+        parts.append(f"Decode: {gen_speed:.1f} t/s")
+
+    return " | ".join(parts)
+
+
 @dataclass
 class RequestClock:
     """Client clock records TTFT on first *content token*, not SSE headers.
@@ -1672,13 +1693,38 @@ if __name__ == "__main__":
             "max_tokens": 16,
         }
         # 1. Test Gateway Context Admission directly against local llama-server token counter
+        # 1a. Positive admission probe
         adm_res = validate_before_proxy(
             probe_payload,
             counter=lambda p: count_using_local_llama_server(p, url="http://127.0.0.1:8080/v1/chat/completions/input_tokens", timeout=5.0),
             context_limit=effective_ctx,
             output_cap=2048,
         )
-        print(f"  [Context Guard Verified] Input tokens: {adm_res.input_tokens} | Reserved output: {adm_res.reserved_output_tokens} | Context ceiling: {adm_res.context_limit} | Remaining capacity: {adm_res.remaining_tokens}", flush=True)
+        print(f"  [Context Guard - Normal Admitted] Input tokens: {adm_res.input_tokens} | Reserved output: {adm_res.reserved_output_tokens} | Context ceiling: {adm_res.context_limit} | Remaining capacity: {adm_res.remaining_tokens}", flush=True)
+
+        # 1b. Negative overflow rejection probe (verify ContextExceeded on oversized prompt)
+        try:
+            validate_before_proxy(
+                probe_payload,
+                counter=lambda p: {"input_tokens": effective_ctx - 10},
+                context_limit=effective_ctx,
+                output_cap=2048,
+            )
+            print("  [Context Guard - Overflow Rejection] WARN: Did not reject oversized context", flush=True)
+        except ContextExceeded as ce:
+            print(f"  [Context Guard - Overflow Rejection Verified] Successfully rejected oversized request: {ce}", flush=True)
+
+        # 1c. Fail-closed on missing/invalid token counter probe
+        try:
+            validate_before_proxy(
+                probe_payload,
+                counter=lambda p: {},
+                context_limit=effective_ctx,
+                output_cap=2048,
+            )
+            print("  [Context Guard - Fail-Closed] WARN: Did not fail closed on missing counter", flush=True)
+        except CountingUnavailable as cu:
+            print(f"  [Context Guard - Fail-Closed Verified] Successfully failed closed on missing counter: {cu}", flush=True)
 
         # 2. Test Stream Chunk Latency Telemetry
         probe_req = urllib.request.Request(
@@ -1697,7 +1743,8 @@ if __name__ == "__main__":
                         pass
         probe_clock.finish()
         c_res = probe_clock.result()
-        print(f"  [Latency Telemetry Verified] TTFT (first content): {c_res.get('ttft_ms', 0):.1f}ms | Total Wall Time: {c_res.get('total_ms', 0):.1f}ms | Native timings: {c_res}", flush=True)
+        summary_str = format_telemetry_summary(c_res)
+        print(f"  [Latency Telemetry Verified] {summary_str} | Raw: {c_res}", flush=True)
     except Exception as e:
         print(f"  [Phase 5.3 Note] Gateway probe check warning: {e}", flush=True)
 

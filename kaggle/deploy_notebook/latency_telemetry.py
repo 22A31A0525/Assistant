@@ -21,6 +21,27 @@ def extract_timings(response: Mapping[str, Any]) -> dict[str, float | int]:
     return result
 
 
+def format_telemetry_summary(clock_result: Mapping[str, Any]) -> str:
+    """Safely format clock results handling missing or NoneType values without formatting exceptions."""
+    ttft = clock_result.get("ttft_ms")
+    ttft_str = f"{ttft:.1f}ms" if isinstance(ttft, (int, float)) else "N/A (no content delta)"
+
+    total = clock_result.get("total_ms")
+    total_str = f"{total:.1f}ms" if isinstance(total, (int, float)) else "N/A"
+
+    parts = [f"TTFT: {ttft_str}", f"Total: {total_str}"]
+
+    prompt_speed = clock_result.get("prompt_per_second")
+    if isinstance(prompt_speed, (int, float)):
+        parts.append(f"Prompt: {prompt_speed:.1f} t/s")
+
+    gen_speed = clock_result.get("predicted_per_second")
+    if isinstance(gen_speed, (int, float)):
+        parts.append(f"Decode: {gen_speed:.1f} t/s")
+
+    return " | ".join(parts)
+
+
 @dataclass
 class RequestClock:
     """Client clock records TTFT on first *content token*, not SSE headers.
