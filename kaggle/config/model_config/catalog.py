@@ -20,6 +20,7 @@ from typing import List, Optional
 from kaggle.config.auth_config.manager import load_accounts
 from kaggle.config.model_config.common import COMMON_RUNTIME_DATASETS
 from kaggle.config.model_config.profile import ModelProfile
+from kaggle.config.model_config.manifest import ModelCompatibilityManifest, ModelCapabilities, CapabilityState
 
 
 def get_active_username() -> str:
@@ -115,6 +116,19 @@ def get_qwen38_27b() -> ModelProfile:
         # Fixed shared vision projector
         mmproj_source="saitejavenkatavinay/qwen36-35b-mmproj",
         mmproj_filename="mmproj-qwen38-27b-f16.gguf",
+        manifest=ModelCompatibilityManifest(
+            model_id="qwen38-27b",
+            gguf_source_repo="saitejavenkatavinay/ornith-qwen38-27b",
+            gguf_filename="Qwen3.8-27B-Q4_K_M.gguf",
+            projector_filename="mmproj-Qwen3.8-27B-f16.gguf",
+            projector_source_repo="saitejavenkatavinay/qwen36-35b-mmproj",
+            capabilities=ModelCapabilities(
+                text=CapabilityState.VERIFIED_BASIC,
+                vision_simple=CapabilityState.UNVERIFIED,
+                vision_complex=CapabilityState.UNVERIFIED,
+                tool_calling=CapabilityState.UNVERIFIED,
+            ),
+        ),
     )
 
 

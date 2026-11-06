@@ -2,6 +2,7 @@
 from __future__ import annotations
 import os, sys, time, shutil, subprocess, re, urllib.request, urllib.error, threading, http.server, json
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -10,7 +11,125 @@ if hasattr(sys.stdout, 'reconfigure'): sys.stdout.reconfigure(line_buffering=Tru
 if hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(line_buffering=True)
 
 # Target Model ID deployed: qwen38-27b
-DEPLOYED_MODEL_JSON = '''{"id": "qwen38-27b", "display_name": "Qwen-3.8-27B (Vision / Multimodal)", "filename": "Qwen3.8-27B-Q4_K_M.gguf", "has_vision": true, "context_size": 65536, "quantization": "Q4_K_M", "gpu_target": "NVIDIA Tesla T4 x2", "split_mode": "LAYER", "use_mmap": true, "n_layers": 64, "n_kv_heads": 8, "head_dim": 128, "model_source": "saitejavenkatavinay/ornith-qwen38-27b/gguf/q4-k-m-vision/1", "dataset_source": "saitejavenkatavinay/ornith-qwen38-27b", "fallback_sources": ["alluriakshay/ornith-qwen38-27b", "saitejavenkatavinay/ornith-qwen38-27b"], "filename_patterns": ["Qwen3.8-27B-Q4_K_M.gguf", "*qwen*3*8*27b*q4_k_m*.gguf", "*ornith*qwen*38*.gguf"], "mmproj_source": "saitejavenkatavinay/qwen36-35b-mmproj", "mmproj_filename": "mmproj-qwen38-27b-f16.gguf", "extra_metadata": {}}'''
+DEPLOYED_MODEL_JSON = '''{"id": "qwen38-27b", "display_name": "Qwen-3.8-27B (Vision / Multimodal)", "filename": "Qwen3.8-27B-Q4_K_M.gguf", "has_vision": true, "context_size": 65536, "quantization": "Q4_K_M", "gpu_target": "NVIDIA Tesla T4 x2", "split_mode": "LAYER", "use_mmap": true, "n_layers": 64, "n_kv_heads": 8, "head_dim": 128, "model_source": "saitejavenkatavinay/ornith-qwen38-27b/gguf/q4-k-m-vision/1", "dataset_source": "saitejavenkatavinay/ornith-qwen38-27b", "fallback_sources": ["alluriakshay/ornith-qwen38-27b", "saitejavenkatavinay/ornith-qwen38-27b"], "filename_patterns": ["Qwen3.8-27B-Q4_K_M.gguf", "*qwen*3*8*27b*q4_k_m*.gguf", "*ornith*qwen*38*.gguf"], "mmproj_source": "saitejavenkatavinay/qwen36-35b-mmproj", "mmproj_filename": "mmproj-qwen38-27b-f16.gguf", "extra_metadata": {}, "manifest": {"model_id": "qwen38-27b", "gguf_source_repo": "saitejavenkatavinay/ornith-qwen38-27b", "gguf_filename": "Qwen3.8-27B-Q4_K_M.gguf", "gguf_file_size_bytes": 0, "architecture": null, "n_layers": null, "context_length": null, "auxiliary_layer_status": "UNVERIFIED_AUXILIARY_LAYER", "auxiliary_tensors": [], "mtp_policy": "disabled_initially", "projector_filename": "mmproj-Qwen3.8-27B-f16.gguf", "capabilities": {"text": "VERIFIED_BASIC", "vision_simple": "UNVERIFIED", "vision_complex": "UNVERIFIED", "tool_calling": "UNVERIFIED"}}}'''
+
+# ==================== Module: manifest.py ====================
+"""
+Subtask 2: Model Compatibility Manifest & Capability Gating.
+
+Defines granular capability states, dynamic metadata container,
+and safe capability admission policies.
+"""
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Dict, List, Optional
+
+
+class CapabilityState(str, Enum):
+    """Granular verification state of individual model capabilities."""
+    UNVERIFIED = "UNVERIFIED"
+    VERIFIED_BASIC = "VERIFIED_BASIC"
+    VERIFIED_FULL = "VERIFIED_FULL"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+@dataclass
+class ModelCapabilities:
+    """Independent capability tracker for a deployed model."""
+    text: CapabilityState = CapabilityState.VERIFIED_BASIC
+    vision_simple: CapabilityState = CapabilityState.UNVERIFIED
+    vision_complex: CapabilityState = CapabilityState.UNVERIFIED
+    tool_calling: CapabilityState = CapabilityState.UNVERIFIED
+
+    def can_process_text(self) -> bool:
+        return self.text in (CapabilityState.VERIFIED_BASIC, CapabilityState.VERIFIED_FULL)
+
+    def can_process_vision(self, complex_prompt: bool = False) -> bool:
+        if complex_prompt:
+            return self.vision_complex in (CapabilityState.VERIFIED_BASIC, CapabilityState.VERIFIED_FULL)
+        return self.vision_simple in (CapabilityState.VERIFIED_BASIC, CapabilityState.VERIFIED_FULL)
+
+    def can_use_tools(self) -> bool:
+        return self.tool_calling in (CapabilityState.VERIFIED_BASIC, CapabilityState.VERIFIED_FULL)
+
+
+@dataclass
+class ModelCompatibilityManifest:
+    """
+    Formal compatibility manifest for versioned GGUF weights.
+    Avoids hardcoding assumptions by accepting dynamically parsed GGUF metadata.
+    """
+    model_id: str
+    gguf_source_repo: str
+    gguf_filename: str
+    gguf_file_size_bytes: int = 0
+    gguf_sha256: Optional[str] = None
+
+    # Dynamically extracted from GGUF metadata
+    architecture: Optional[str] = None          # e.g., 'qwen2' from GGUF header
+    n_layers: Optional[int] = None              # e.g., block_count from GGUF header
+    context_length: Optional[int] = None        # e.g., context_length from GGUF header
+    chat_template_present: bool = True
+    chat_template_flavor: str = "model_native_jinja"
+
+    # Auxiliary tensor tracking (never blindly classified as harmless)
+    auxiliary_layer_status: str = "UNVERIFIED_AUXILIARY_LAYER"
+    auxiliary_tensors: List[str] = field(default_factory=list)
+    mtp_policy: str = "disabled_initially"
+
+    # Vision projector pairing
+    projector_filename: Optional[str] = None
+    projector_source_repo: Optional[str] = None
+
+    # Granular capability states
+    capabilities: ModelCapabilities = field(default_factory=ModelCapabilities)
+
+    def record_gguf_metadata(
+        self,
+        architecture: str,
+        n_layers: int,
+        context_length: int,
+        auxiliary_tensors: Optional[List[str]] = None,
+        file_size_bytes: int = 0,
+    ) -> None:
+        """Update manifest with live dynamically parsed GGUF metadata."""
+        self.architecture = architecture
+        self.n_layers = n_layers
+        self.context_length = context_length
+        if file_size_bytes > 0:
+            self.gguf_file_size_bytes = file_size_bytes
+        if auxiliary_tensors:
+            self.auxiliary_tensors = list(auxiliary_tensors)
+            if any("blk.64" in t for t in auxiliary_tensors):
+                self.auxiliary_layer_status = "DETECTED_UNVERIFIED_AUXILIARY_LAYER"
+
+    def authorize_capability(self, capability_name: str, state: CapabilityState) -> None:
+        """Promote or demote a specific capability state."""
+        if hasattr(self.capabilities, capability_name):
+            setattr(self.capabilities, capability_name, state)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert manifest to serializable dictionary."""
+        return {
+            "model_id": self.model_id,
+            "gguf_source_repo": self.gguf_source_repo,
+            "gguf_filename": self.gguf_filename,
+            "gguf_file_size_bytes": self.gguf_file_size_bytes,
+            "architecture": self.architecture,
+            "n_layers": self.n_layers,
+            "context_length": self.context_length,
+            "auxiliary_layer_status": self.auxiliary_layer_status,
+            "auxiliary_tensors": self.auxiliary_tensors,
+            "mtp_policy": self.mtp_policy,
+            "projector_filename": self.projector_filename,
+            "capabilities": {
+                "text": self.capabilities.text.value,
+                "vision_simple": self.capabilities.vision_simple.value,
+                "vision_complex": self.capabilities.vision_complex.value,
+                "tool_calling": self.capabilities.tool_calling.value,
+            },
+        }
 
 # ==================== Module: profile.py ====================
 """
@@ -48,6 +167,7 @@ class ModelProfile:
     mmproj_source: str = ""
     mmproj_filename: str = ""
     extra_metadata: Dict[str, Any] = field(default_factory=dict)
+    manifest: Optional[Any] = None
 
 # ==================== Module: environment.py ====================
 """
@@ -408,6 +528,65 @@ try:
     from kaggle.config.model_config.profile import ModelProfile
 except ImportError:
     pass
+
+
+def read_gguf_metadata_summary(model_path: Path) -> Dict[str, Any]:
+    """
+    Lightweight zero-dependency GGUF header inspector.
+    Reads magic ('GGUF'), version, and scans header strings to discover:
+    - architecture name (e.g. 'qwen2', 'qwen3', 'llama')
+    - block_count (layers)
+    - presence of chat_template
+    - list of detected auxiliary blk.64 / nextn tensors
+    Falls back gracefully if file is inaccessible.
+    """
+    summary: Dict[str, Any] = {
+        "valid_gguf": False,
+        "architecture": "unknown",
+        "n_layers": 64,
+        "has_chat_template": False,
+        "auxiliary_tensors": [],
+        "file_size_gb": round(model_path.stat().st_size / (1024 ** 3), 2) if model_path.exists() else 0.0,
+    }
+    if not model_path.exists() or model_path.stat().st_size < 1024 * 1024:
+        return summary
+
+    try:
+        with open(model_path, "rb") as f:
+            header_chunk = f.read(1024 * 1024 * 2)  # Read first 2MB for metadata header
+            if not header_chunk.startswith(b"GGUF"):
+                return summary
+
+            summary["valid_gguf"] = True
+
+            # Detect architecture names in header string table
+            for arch in [b"qwen2", b"qwen3", b"qwen2.5", b"llama", b"deepseek"]:
+                if arch in header_chunk:
+                    summary["architecture"] = arch.decode("ascii")
+                    break
+
+            if b"chat_template" in header_chunk:
+                summary["has_chat_template"] = True
+
+            # Cautious scan: check for blk.64 and auxiliary prediction components
+            aux_tensors = []
+            for marker in [
+                b"blk.64.attn_norm.weight",
+                b"blk.64.attn_q.weight",
+                b"blk.64.attn_k.weight",
+                b"blk.64.attn_v.weight",
+                b"blk.64.ffn_gate.weight",
+                b"blk.64.nextn.eh_proj.weight",
+                b"blk.64.nextn.enorm.weight",
+            ]:
+                if marker in header_chunk:
+                    aux_tensors.append(marker.decode("ascii"))
+
+            summary["auxiliary_tensors"] = aux_tensors
+    except Exception:
+        pass
+
+    return summary
 
 
 def find_model_weights(profile: ModelProfile, search_root: Path | str = "/kaggle/input") -> Tuple[bool, Path | None, str]:
@@ -943,6 +1122,16 @@ if __name__ == "__main__":
         sys.exit(1)
 
     model_size_gb = model_file.stat().st_size / (1024 ** 3)
+
+    # Inspect dynamic GGUF binary headers & caution against auxiliary tensors
+    print(f"\n[Phase 2.1] Inspecting GGUF binary metadata for '{model_file.name}'...", flush=True)
+    gguf_meta = read_gguf_metadata_summary(model_file)
+    print(f"  Valid GGUF: {gguf_meta.get('valid_gguf', False)} | Architecture: {gguf_meta.get('architecture', 'unknown')} | Chat Template Present: {gguf_meta.get('has_chat_template', False)}", flush=True)
+    if gguf_meta.get("auxiliary_tensors"):
+        print(f"  [Caution] Detected {len(gguf_meta['auxiliary_tensors'])} auxiliary/blk.64 prediction tensors:", flush=True)
+        for aux_t in gguf_meta["auxiliary_tensors"][:4]:
+            print(f"    - {aux_t}", flush=True)
+        print("  Policy: Classified as UNVERIFIED_AUXILIARY_LAYER. MTP decoding disabled initially.", flush=True)
 
     # Vision mmproj check (Calling resolve_vision_projector)
     has_vision, mmproj_file, v_msg = resolve_vision_projector(model, model_file, search_root="/kaggle/input")

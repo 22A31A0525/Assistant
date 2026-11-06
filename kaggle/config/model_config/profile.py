@@ -34,3 +34,4 @@ class ModelProfile:
     mmproj_source: str = ""
     mmproj_filename: str = ""
     extra_metadata: Dict[str, Any] = field(default_factory=dict)
+    manifest: Optional[Any] = None

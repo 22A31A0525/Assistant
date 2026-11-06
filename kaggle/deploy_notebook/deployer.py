@@ -24,6 +24,7 @@ from kaggle.config.model_config.profile import ModelProfile
 from kaggle.deploy_notebook.metadata import generate_kernel_metadata
 
 MODULE_FILES = [
+    (Path(__file__).resolve().parents[1] / "config" / "model_config" / "manifest.py", "manifest.py"),
     (Path(__file__).resolve().parents[1] / "config" / "model_config" / "profile.py", "profile.py"),
     (Path(__file__).resolve().parent / "environment.py", "environment.py"),
     (Path(__file__).resolve().parent / "model_resolver.py", "model_resolver.py"),
@@ -40,11 +41,16 @@ def bundle_worker_script(target_model: ModelProfile, deploy_dir: Path) -> Path:
     """
     worker_path = deploy_dir / "worker.py"
     
+    model_dict = dict(target_model.__dict__)
+    if model_dict.get("manifest") and hasattr(model_dict["manifest"], "to_dict"):
+        model_dict["manifest"] = model_dict["manifest"].to_dict()
+
     sections = [
         '"""Auto-generated Kaggle worker entry compiled from deploy_notebook sub-modules."""',
         "from __future__ import annotations",
         "import os, sys, time, shutil, subprocess, re, urllib.request, urllib.error, threading, http.server, json",
         "from dataclasses import dataclass, field",
+        "from enum import Enum",
         "from pathlib import Path",
         "from typing import Any, Dict, List, Optional, Tuple",
         "",
@@ -53,7 +59,7 @@ def bundle_worker_script(target_model: ModelProfile, deploy_dir: Path) -> Path:
         "if hasattr(sys.stderr, 'reconfigure'): sys.stderr.reconfigure(line_buffering=True)",
         "",
         f"# Target Model ID deployed: {target_model.id}",
-        f"DEPLOYED_MODEL_JSON = '''{json.dumps(target_model.__dict__)}'''",
+        f"DEPLOYED_MODEL_JSON = '''{json.dumps(model_dict)}'''",
     ]
 
     for fpath, label in MODULE_FILES:
@@ -97,6 +103,16 @@ if __name__ == "__main__":
         sys.exit(1)
 
     model_size_gb = model_file.stat().st_size / (1024 ** 3)
+
+    # Inspect dynamic GGUF binary headers & caution against auxiliary tensors
+    print(f"\\n[Phase 2.1] Inspecting GGUF binary metadata for '{model_file.name}'...", flush=True)
+    gguf_meta = read_gguf_metadata_summary(model_file)
+    print(f"  Valid GGUF: {gguf_meta.get('valid_gguf', False)} | Architecture: {gguf_meta.get('architecture', 'unknown')} | Chat Template Present: {gguf_meta.get('has_chat_template', False)}", flush=True)
+    if gguf_meta.get("auxiliary_tensors"):
+        print(f"  [Caution] Detected {len(gguf_meta['auxiliary_tensors'])} auxiliary/blk.64 prediction tensors:", flush=True)
+        for aux_t in gguf_meta["auxiliary_tensors"][:4]:
+            print(f"    - {aux_t}", flush=True)
+        print("  Policy: Classified as UNVERIFIED_AUXILIARY_LAYER. MTP decoding disabled initially.", flush=True)
 
     # Vision mmproj check (Calling resolve_vision_projector)
     has_vision, mmproj_file, v_msg = resolve_vision_projector(model, model_file, search_root="/kaggle/input")

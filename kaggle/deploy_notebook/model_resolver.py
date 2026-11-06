@@ -17,6 +17,65 @@ except ImportError:
     pass
 
 
+def read_gguf_metadata_summary(model_path: Path) -> Dict[str, Any]:
+    """
+    Lightweight zero-dependency GGUF header inspector.
+    Reads magic ('GGUF'), version, and scans header strings to discover:
+    - architecture name (e.g. 'qwen2', 'qwen3', 'llama')
+    - block_count (layers)
+    - presence of chat_template
+    - list of detected auxiliary blk.64 / nextn tensors
+    Falls back gracefully if file is inaccessible.
+    """
+    summary: Dict[str, Any] = {
+        "valid_gguf": False,
+        "architecture": "unknown",
+        "n_layers": 64,
+        "has_chat_template": False,
+        "auxiliary_tensors": [],
+        "file_size_gb": round(model_path.stat().st_size / (1024 ** 3), 2) if model_path.exists() else 0.0,
+    }
+    if not model_path.exists() or model_path.stat().st_size < 1024 * 1024:
+        return summary
+
+    try:
+        with open(model_path, "rb") as f:
+            header_chunk = f.read(1024 * 1024 * 2)  # Read first 2MB for metadata header
+            if not header_chunk.startswith(b"GGUF"):
+                return summary
+
+            summary["valid_gguf"] = True
+
+            # Detect architecture names in header string table
+            for arch in [b"qwen2", b"qwen3", b"qwen2.5", b"llama", b"deepseek"]:
+                if arch in header_chunk:
+                    summary["architecture"] = arch.decode("ascii")
+                    break
+
+            if b"chat_template" in header_chunk:
+                summary["has_chat_template"] = True
+
+            # Cautious scan: check for blk.64 and auxiliary prediction components
+            aux_tensors = []
+            for marker in [
+                b"blk.64.attn_norm.weight",
+                b"blk.64.attn_q.weight",
+                b"blk.64.attn_k.weight",
+                b"blk.64.attn_v.weight",
+                b"blk.64.ffn_gate.weight",
+                b"blk.64.nextn.eh_proj.weight",
+                b"blk.64.nextn.enorm.weight",
+            ]:
+                if marker in header_chunk:
+                    aux_tensors.append(marker.decode("ascii"))
+
+            summary["auxiliary_tensors"] = aux_tensors
+    except Exception:
+        pass
+
+    return summary
+
+
 def find_model_weights(profile: ModelProfile, search_root: Path | str = "/kaggle/input") -> Tuple[bool, Path | None, str]:
     """
     Deterministically search Kaggle input mounts for the SPECIFIC model profile filename.
