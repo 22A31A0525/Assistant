@@ -51,7 +51,8 @@ def build_native_server_command(
         "--flash-attn", "on",             # Takes 'on', 'off', or 'auto'
         "--cache-type-k", "q8_0",
         "--cache-type-v", "q8_0",
-        "--threads", "4",
+        "--threads", "4",                 # Generation evaluation threads (matching Kaggle 4 vCPUs)
+        "--threads-batch", "4",           # Batch prompt ingestion threads (prevents thread contention/jitter)
     ]
 
     if mmproj_path:

@@ -922,7 +922,8 @@ def build_native_server_command(
         "--flash-attn", "on",             # Takes 'on', 'off', or 'auto'
         "--cache-type-k", "q8_0",
         "--cache-type-v", "q8_0",
-        "--threads", "4",
+        "--threads", "4",                 # Generation evaluation threads (matching Kaggle 4 vCPUs)
+        "--threads-batch", "4",           # Batch prompt ingestion threads (prevents thread contention/jitter)
     ]
 
     if mmproj_path:
@@ -1170,10 +1171,38 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(err)
         return False
 
+    def query_actual_input_tokens(self, body: bytes) -> Optional[int]:
+        """
+        Query llama-server's native /v1/chat/completions/input_tokens (or /tokenize) endpoint.
+        Returns exact model-tokenized integer count of input messages and tool schemas,
+        or None if upstream counting is unreachable.
+        """
+        tokenize_url = f"http://127.0.0.1:{self.upstream_port}/v1/chat/completions/input_tokens"
+        try:
+            req = urllib.request.Request(
+                tokenize_url,
+                data=body,
+                headers={"Content-Type": "application/json", "User-Agent": "AuthGateway/1.0"},
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    data = json.loads(resp.read().decode("utf-8", errors="ignore"))
+                    # llama-server returns {"input_tokens": N} or {"tokens": [...]}
+                    if "input_tokens" in data and isinstance(data["input_tokens"], int):
+                        return data["input_tokens"]
+                    if "tokens" in data and isinstance(data["tokens"], list):
+                        return len(data["tokens"])
+        except Exception:
+            pass
+        return None
+
     def validate_context_limits(self, body: Optional[bytes]) -> Tuple[bool, Optional[str]]:
         """
-        Subtask 3 Hard Safeguard: Prevent requests exceeding maximum context window (65,536).
-        Calculates approximate prompt tokens and verifies against max_prompt_tokens ceiling.
+        Subtask 4 Model-Aware Context Admission:
+        Enforces: Input tokens + Reserved output tokens <= 65,536.
+        First queries native model tokenizer (/v1/chat/completions/input_tokens).
+        Fails closed if body cannot be validated or exceeds ceiling.
         """
         if not body or not self.path.startswith("/v1/chat/completions"):
             return True, None
@@ -1182,8 +1211,20 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
             payload = json.loads(body.decode("utf-8", errors="ignore"))
             messages = payload.get("messages", [])
             max_tokens = payload.get("max_tokens", 2048) or 2048
-            
-            # Approximate token length: text characters / 3.8 + image base64 patch allowance
+            ceiling = self.max_context_tokens - max_tokens
+
+            # 1. Attempt model-aware exact token count from upstream llama-server
+            actual_input_tokens = self.query_actual_input_tokens(body)
+            if actual_input_tokens is not None:
+                if actual_input_tokens > ceiling:
+                    return False, (
+                        f"Model-aware input token count ({actual_input_tokens:,} tokens) plus requested generation "
+                        f"({max_tokens:,} tokens) exceeds context limit ({self.max_context_tokens:,}). "
+                        f"Max allowable input is {ceiling:,} tokens."
+                    )
+                return True, None
+
+            # 2. Conservative fallback token accounting (handles multimodal patches & tool definitions)
             total_chars = 0
             image_token_allowance = 0
             for msg in messages:
@@ -1196,22 +1237,26 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
                             if part.get("type") == "text":
                                 total_chars += len(part.get("text", ""))
                             elif part.get("type") == "image_url":
-                                # Qwen-VL allocates standard patch grid (~1024 tokens minimum)
                                 image_token_allowance += 1024
 
-            estimated_prompt_tokens = int(total_chars / 3.8) + image_token_allowance
-            ceiling = self.max_context_tokens - max_tokens
+            # Include tool definitions if present
+            tools = payload.get("tools", [])
+            if tools:
+                total_chars += len(json.dumps(tools))
 
-            if estimated_prompt_tokens > ceiling:
+            # Conservative ratio: 3.5 chars/token for dense code/JSON
+            conservative_prompt_tokens = int(total_chars / 3.5) + image_token_allowance
+
+            if conservative_prompt_tokens > ceiling:
                 return False, (
-                    f"Request prompt size (~{estimated_prompt_tokens:,} tokens) plus requested generation "
-                    f"({max_tokens:,} tokens) exceeds maximum context capacity ({self.max_context_tokens:,}). "
-                    f"Safe prompt limit is {ceiling:,} tokens."
+                    f"Conservative prompt size (~{conservative_prompt_tokens:,} tokens) plus requested generation "
+                    f"({max_tokens:,} tokens) exceeds context limit ({self.max_context_tokens:,}). "
+                    f"Max allowable input is {ceiling:,} tokens."
                 )
             return True, None
-        except Exception:
-            # If body is not standard JSON, allow upstream to parse or reject
-            return True, None
+        except Exception as e:
+            # Fail-closed on malformed JSON payload on /v1/chat/completions
+            return False, f"Malformed JSON payload: {str(e)}"
 
     def do_GET(self):
         if not self.check_auth():

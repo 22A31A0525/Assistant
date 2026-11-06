@@ -100,4 +100,4 @@ def test_auth_gateway_hard_context_overflow_rejection():
     valid, err = handler.validate_context_limits(huge_payload)
     assert valid is False
     assert err is not None
-    assert "exceeds maximum context capacity" in err
+    assert "exceeds context limit" in err
