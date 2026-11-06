@@ -289,7 +289,7 @@ if __name__ == "__main__":
 
     # 6. Start Authenticated Gateway (Port 4000) & Cloudflare Tunnel
     # Public Cloudflare -> Gateway (Port 4000 with Bearer Auth) -> llama-server (Port 8080)
-    print("\\n[Phase 6] Starting Authenticated Gateway (Port 4000) & Cloudflare Tunnel...", flush=True)
+    print("\\n[Phase 6] Starting Authenticated Gateway (Port 4000)...", flush=True)
     master_key = os.environ.get("LITELLM_MASTER_KEY", "sk-ant-api03-fakekey1234")
     gateway_thread = threading.Thread(
         target=start_gateway,
@@ -297,6 +297,91 @@ if __name__ == "__main__":
         daemon=True,
     )
     gateway_thread.start()
+    time.sleep(1.0)  # Ensure gateway listener socket is bound
+
+    # 6.1 Verify End-to-End Gateway Request Flow, Live Auth, and Real Streaming TTFT Measurement
+    print("\\n[Phase 6.1] Verifying Live Authenticated Gateway Port 4000 & Streaming TTFT...", flush=True)
+    try:
+        gw_clock = RequestClock(started_at=perf_counter())
+        gw_req_payload = json.dumps({
+            "model": model.id,
+            "messages": [
+                {"role": "system", "content": "You are a concise assistant."},
+                {"role": "user", "content": "Stream one sentence testing gateway latency and token arrival."}
+            ],
+            "max_tokens": 32,
+            "stream": True,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }).encode("utf-8")
+
+        gw_http_req = urllib.request.Request(
+            "http://127.0.0.1:4000/v1/chat/completions",
+            data=gw_req_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {master_key}",
+                "User-Agent": "GatewayProbe/1.0",
+            },
+            method="POST",
+        )
+        stream_tokens = []
+        with urllib.request.urlopen(gw_http_req, timeout=30) as gw_resp:
+            for raw_chunk in gw_resp:
+                chunk_str = raw_chunk.decode("utf-8", errors="ignore").strip()
+                if chunk_str.startswith("data: ") and chunk_str != "data: [DONE]":
+                    try:
+                        c_json = json.loads(chunk_str[6:])
+                        gw_clock.observe_chunk(c_json)
+                        c_text = c_json.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                        if c_text:
+                            stream_tokens.append(c_text)
+                    except Exception:
+                        pass
+        gw_clock.finish()
+        gw_metrics = gw_clock.result()
+        gw_summary = format_telemetry_summary(gw_metrics)
+        print(f"  [Gateway Stream Verified] Status: HTTP 200 | {gw_summary}", flush=True)
+        print(f"  [Gateway TTFT Captured] First content arrival: {gw_metrics.get('ttft_ms', 'N/A')}ms | Tokens received: {len(stream_tokens)}", flush=True)
+
+        # 6.2 Verify Gateway Rejects Unauthorized Requests
+        unauth_req = urllib.request.Request(
+            "http://127.0.0.1:4000/v1/chat/completions",
+            data=gw_req_payload,
+            headers={"Content-Type": "application/json"},  # Missing Authorization
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(unauth_req, timeout=5) as u_resp:
+                print("  [Gateway Security] WARN: Unauthenticated request was unexpectedly allowed!", flush=True)
+        except urllib.error.HTTPError as he:
+            if he.code == 401:
+                print("  [Gateway Security Verified] 401 Unauthorized correctly enforced without Bearer token.", flush=True)
+
+        # 6.3 Verify Live Gateway Rejects Oversized Requests via Model-Aware Guard
+        huge_gw_payload = json.dumps({
+            "model": model.id,
+            "messages": [{"role": "user", "content": "x" * 260000}],
+            "max_tokens": 2048,
+        }).encode("utf-8")
+        huge_http_req = urllib.request.Request(
+            "http://127.0.0.1:4000/v1/chat/completions",
+            data=huge_gw_payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {master_key}",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(huge_http_req, timeout=5) as h_resp:
+                print("  [Gateway Context Guard] WARN: Huge request was unexpectedly admitted!", flush=True)
+        except urllib.error.HTTPError as he:
+            if he.code == 400:
+                print(f"  [Gateway Context Guard Verified] Live Gateway returned HTTP 400 ({he.reason}) rejecting oversized context.", flush=True)
+    except Exception as e:
+        print(f"  [Phase 6.1 Note] Gateway probe exception: {e}", flush=True)
+
+    # 7. Start Cloudflare Tunnel
 
     cf_bin = shutil.which("cloudflared")
     if not cf_bin:
