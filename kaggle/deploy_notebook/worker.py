@@ -1316,11 +1316,6 @@ import urllib.request
 import urllib.error
 from typing import Optional, Tuple, Mapping, Any
 
-    validate_before_proxy,
-    AdmissionError,
-    ContextExceeded,
-    CountingUnavailable,
-)
 
 
 class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):

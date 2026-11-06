@@ -69,8 +69,15 @@ def bundle_worker_script(target_model: ModelProfile, deploy_dir: Path) -> Path:
         if fpath.exists():
             code = fpath.read_text(encoding="utf-8")
             clean_lines = []
+            skip_multiline_import = False
             for line in code.splitlines():
+                if skip_multiline_import:
+                    if ")" in line:
+                        skip_multiline_import = False
+                    continue
                 if line.startswith("from kaggle.") or line.startswith("import kaggle.") or "from __future__ import annotations" in line:
+                    if "(" in line and ")" not in line:
+                        skip_multiline_import = True
                     continue
                 clean_lines.append(line)
             sections.append(f"\n# ==================== Module: {label} ====================")
