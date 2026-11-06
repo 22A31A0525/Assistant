@@ -18,7 +18,8 @@ Assistant/
 │   ├── test_deploy_notebook.py
 │   ├── test_model_compatibility.py
 │   ├── test_subtask3_memory_optimization.py
-│   └── test_subtask4_runtime.py
+│   ├── test_subtask4_runtime.py
+│   └── test_subtask5_gateway.py
 └── kaggle/                    # Dedicated Kaggle remote GPU backend package
     ├── __init__.py
     ├── cli.py                 # Unified Kaggle Hub CLI (python -m kaggle.cli)
@@ -165,13 +166,40 @@ Qwen3.8-27B employs a hybrid attention structure:
 
 ---
 
+## 🛡️ Subtask 5: API Gateway, Streaming & Remote Connection Reliability
+
+### 1. Atomic Single-Slot Concurrency Scheduler (`SingleSlotScheduler`)
+- Concurrency protection for `--parallel 1` inference slots: exactly one active caller admitted to GPU inference at any instant.
+- Thread-safe bounded wait queue of depth 1 (`max_queue=1`).
+- **Immediate Overload Rejection:** When slot and queue are occupied, subsequent requests are immediately rejected with **HTTP 429 (`SLOT_OVERLOADED`)** and `Retry-After: 5` header, eliminating unbounded queue delays.
+- **Acquisition Timeout:** Callers waiting in the queue exceeding `queue_timeout` (5.0s) fail safely with **HTTP 503 (`SLOT_ACQUISITION_TIMEOUT`)**.
+- **Atomic Release Guarantee:** Wrapped in strict `finally:` blocks ensuring the slot permit is released immediately upon request completion or client socket drop.
+
+### 2. Lossless SSE Transport & UTF-8 / Tool-Call Argument Streaming
+- Replaces intermediate JSON parsing and reconstructing with transparent chunked byte forwarding over `Transfer-Encoding: chunked`.
+- **UTF-8 Multi-byte Preservation:** Raw byte stream forwarding prevents truncation or corruptions when 3-byte or 4-byte UTF-8 sequences cross network chunk boundaries.
+- **Incremental Tool-Call JSON Stream:** Function argument fragments (e.g., `{"code":`, `"print(1)"`, `"}"`) stream verbatim without modification, allowing clients to reassemble arbitrary JSON payloads before parsing.
+- **Reasoning Deltas:** Unmodified forwarding of native `<think>` blocks and reasoning tokens directly to client telemetry.
+
+### 3. Client-Disconnect Cancellation & Upstream Fault Recovery
+- Actively detects client connection aborts (`BrokenPipeError`, `ConnectionResetError`) during streaming.
+- Guarantees immediate reclamation of the single-slot permit so following callers are not blocked by orphaned socket handles.
+- Upstream server disconnects or restarts are caught cleanly, returning **HTTP 503 (`SERVICE_UNAVAILABLE`)** with `Retry-After: 5` header instead of hanging.
+
+### 4. Route Whitelisting, Body Size Caps & Correlation Tracing
+- **Route Whitelisting:** Strictly limits incoming traffic to `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/chat/completions/input_tokens`, and authenticated `/v1/shutdown`.
+- **Payload Limits:** Fast-paths request bodies larger than 15 MB with **HTTP 413 (`PAYLOAD_TOO_LARGE`)**.
+- **Request Tracing:** Generates and propagates unique `X-Request-ID` across every client interaction and error response for distributed telemetry.
+
+---
+
 ## 🧪 Testing & Verification
 
 Run the full pytest suite:
 ```bash
 python -m pytest tests/ -v
 ```
-**Test Coverage (27/27 Passing):**
+**Test Coverage (34/34 Passing):**
 - Native `llama-server` command flag generation (`--parallel 1`, `--no-reasoning-preserve`, `--flash-attn on`, `--ctx-size 65536`, `--threads 4`, `--threads-batch 4`).
 - Hardware VRAM and system host RAM inspection fallbacks.
 - Bearer token security boundary & 401 gatekeeper.
@@ -188,3 +216,10 @@ python -m pytest tests/ -v
 - Non-streaming TTFT handling (no false values fabricated).
 - Thread oversubscription rejection policy.
 - Command policy validation.
+- Single-slot scheduler immediate acquire and release.
+- Single-slot scheduler atomic queue-full rejection (HTTP 429).
+- Gateway route whitelist validation and path traversal rejection.
+- Gateway 15 MB body size limit enforcement (HTTP 413).
+- Lossless SSE multi-byte UTF-8 preservation & tool-call argument fragment reassembly.
+- Client disconnect (`BrokenPipeError`) slot release guarantee.
+- Upstream server unreachable clean HTTP 503 recovery.
