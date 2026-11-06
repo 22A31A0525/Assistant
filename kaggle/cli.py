@@ -14,23 +14,33 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
+from kaggle.config.api_end_point_config import (
+    get_tunnel_endpoint,
+    ping_endpoint,
+    resolve_live_endpoint,
+)
 from kaggle.config.auth_config.manager import (
     apply_active_credentials,
     load_accounts,
     verify_account,
 )
 from kaggle.config.model_config.catalog import ModelCatalog
+from kaggle.chat import run_live_chat
+from kaggle.deploy_notebook.deployer import run_deployment_wizard
+from kaggle.tracker.kernel_stopper import run_emergency_stopper_menu
 
 
 def print_banner() -> None:
     active, _ = load_accounts()
     active_user = active.username if active else "None"
+    tunnel = get_tunnel_endpoint()
 
     print("\n" + "=" * 60)
     print("           KAGGLE REMOTE GPU ASSISTANT HUB            ")
     print("=" * 60)
     print(f"  • Active Kaggle Account : {active_user}")
     print(f"  • Active Workspace      : {WORKSPACE_ROOT.name}")
+    print(f"  • Configured Tunnel     : {tunnel}")
     print("=" * 60)
 
 
@@ -106,12 +116,14 @@ def main_menu() -> None:
         print("  [1] Authentication & Multi-Account Switcher")
         print("  [2] Model Catalog (Ornith 35B / Qwen 3.6 / Qwen 3.8)")
         print("  [3] Test Kaggle API Connection")
-        print("  [4] Kernel Deployment (Push to Kaggle GPU)")
-        print("  [5] Kernel Execution Logs & Tunnel Status")
-        print("  [6] Emergency GPU Stopper (Release Quota)")
+        print("  [4] Ping Remote Tunnel Endpoint")
+        print("  [5] Live Chat with Active Model (Stream via Kaggle GPU)")
+        print("  [6] Kernel Deployment (Push to Kaggle GPU)")
+        print("  [7] Kernel Execution Logs & Tunnel Status")
+        print("  [8] Emergency GPU Stopper (Release Quota)")
         print("  [0] Exit\n")
 
-        choice = input("Select operation [0-6]: ").strip()
+        choice = input("Select operation [0-8]: ").strip()
 
         if choice == "0":
             print("\nExiting Kaggle Hub. Goodbye!")
@@ -125,8 +137,21 @@ def main_menu() -> None:
             ok, msg = verify_account()
             status = "SUCCESS" if ok else "FAILED"
             print(f"[{status}] {msg}")
-        elif choice in ("4", "5", "6"):
-            print(f"\n[Info] Operation [{choice}] will be wired up as we build the deploy & tracker modules next!")
+        elif choice == "4":
+            print("\nVerifying remote tunnel endpoint...")
+            is_online, url, message, model_name = resolve_live_endpoint()
+            status = "ONLINE" if is_online else "OFFLINE"
+            print(f"[{status}] {message}")
+            if model_name:
+                print(f"Active Remote Model: {model_name}")
+        elif choice == "5":
+            run_live_chat()
+        elif choice == "6":
+            run_deployment_wizard()
+        elif choice == "7":
+            print(f"\n[Info] Kernel Execution Logs viewer will be wired up next!")
+        elif choice == "8":
+            run_emergency_stopper_menu()
         else:
             print("\nInvalid choice. Please select from the menu.")
 

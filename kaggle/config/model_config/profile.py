@@ -1,8 +1,10 @@
-"""Data models defining LLM profiles, quantization, and vision/multimodal capabilities."""
+"""
+ModelProfile definition bundled for standalone execution.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 @dataclass
@@ -13,25 +15,22 @@ class ModelProfile:
     display_name: str
     filename: str
     has_vision: bool = False
-    context_size: int = 32768
+    context_size: int = 65536
     quantization: str = "Q4_K_M"
     gpu_target: str = "NVIDIA Tesla T4 x2"
     split_mode: str = "LAYER"
     use_mmap: bool = True
     
-    # Kaggle source definitions (model/dataset slugs)
+    # Model architecture parameters for accurate KV cache calculation
+    n_layers: int = 64
+    n_kv_heads: int = 8
+    head_dim: int = 128
+    
     model_source: str = ""
     dataset_source: str = ""
     fallback_sources: List[str] = field(default_factory=list)
     filename_patterns: List[str] = field(default_factory=list)
     
-    # Multimodal / Vision projector config (for Qwen 3.6 / Qwen 3.8)
     mmproj_source: str = ""
     mmproj_filename: str = ""
-    
     extra_metadata: Dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def is_multimodal(self) -> bool:
-        """True if the model supports vision / image analysis."""
-        return self.has_vision and bool(self.mmproj_source or self.mmproj_filename)

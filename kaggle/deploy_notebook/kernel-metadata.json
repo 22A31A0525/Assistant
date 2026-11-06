@@ -1,0 +1,23 @@
+{
+  "id": "alluriakshay/assistant-worker-alluriakshay",
+  "title": "Assistant Worker (alluriakshay)",
+  "code_file": "worker.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "machine_shape": "NvidiaTeslaT4",
+  "enable_internet": "true",
+  "docker_image_pinning_type": "latest",
+  "dataset_sources": [
+    "rohitvijayadapa/ornith-runtime-wheels",
+    "rohitvijayadapa/ornith-runtime-cuda12-sm75",
+    "saitejavenkatavinay/ornith-qwen38-27b",
+    "saitejavenkatavinay/qwen36-35b-mmproj"
+  ],
+  "competition_sources": [],
+  "kernel_sources": [],
+  "model_sources": [
+    "saitejavenkatavinay/ornith-qwen38-27b/gguf/q4-k-m-vision/1"
+  ]
+}
