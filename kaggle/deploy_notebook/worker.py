@@ -869,6 +869,184 @@ def check_resource_admission(
 
     return False, 0, breakdown, f"Model size ({model_size_gb:.2f} GB) too large to maintain required per-GPU VRAM safety headroom."
 
+# ==================== Module: latency_telemetry.py ====================
+"""Timing extraction compatible with llama.cpp completion and SSE payloads."""
+from dataclasses import dataclass, field
+from time import perf_counter
+from typing import Any, Mapping
+
+TIMING_KEYS = ('prompt_ms', 'prompt_per_second', 'prompt_n', 'predicted_ms', 'predicted_per_second', 'predicted_n', 'cache_n')
+
+
+def extract_timings(response: Mapping[str, Any]) -> dict[str, float | int]:
+    """Only accept finite numeric native timings; no fabrication from token counts."""
+    import math
+    source = response.get('timings', {}) if isinstance(response, Mapping) else {}
+    if not isinstance(source, Mapping):
+        return {}
+    result = {}
+    for key in TIMING_KEYS:
+        value = source.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value >= 0:
+            result[key] = value
+    return result
+
+
+@dataclass
+class RequestClock:
+    """Client clock records TTFT on first *content token*, not SSE headers.
+
+    For streams, call observe_chunk() for each decoded SSE JSON payload.
+    For non-streaming calls, TTFT is unavailable unless measured separately.
+    """
+    started_at: float = field(default_factory=perf_counter)
+    first_content_at: float | None = None
+    finished_at: float | None = None
+    native_timings: dict[str, float | int] = field(default_factory=dict)
+
+    def observe_chunk(self, chunk: Mapping[str, Any], *, at: float | None = None) -> None:
+        stamp = perf_counter() if at is None else at
+        choices = chunk.get('choices', []) if isinstance(chunk, Mapping) else []
+        if isinstance(choices, list):
+            for choice in choices:
+                if not isinstance(choice, Mapping):
+                    continue
+                delta = choice.get('delta', {})
+                if isinstance(delta, Mapping) and (delta.get('content') or delta.get('tool_calls')) and self.first_content_at is None:
+                    self.first_content_at = stamp
+        timings = extract_timings(chunk)
+        if timings:
+            self.native_timings.update(timings)
+
+    def observe_response(self, response: Mapping[str, Any]) -> None:
+        self.native_timings.update(extract_timings(response))
+
+    def finish(self, *, at: float | None = None) -> None:
+        self.finished_at = perf_counter() if at is None else at
+
+    def result(self) -> dict[str, float | int | None]:
+        out: dict[str, float | int | None] = dict(self.native_timings)
+        out['ttft_ms'] = None if self.first_content_at is None else max(0.0, (self.first_content_at - self.started_at) * 1000)
+        out['total_ms'] = None if self.finished_at is None else max(0.0, (self.finished_at - self.started_at) * 1000)
+        return out
+
+# ==================== Module: context_admission.py ====================
+"""Standalone model-aware admission helpers for a trusted local llama-server.
+
+Call from the authenticated gateway before proxying any chat completion. Never
+forward a request when token admission is unavailable or inconclusive.
+"""
+
+from dataclasses import dataclass
+import json
+from typing import Any, Callable, Mapping
+from urllib.request import Request, urlopen
+
+
+class AdmissionError(Exception):
+    """Malformed or context-exceeding client request."""
+    status_code = 400
+    error_code = 'INVALID_REQUEST'
+
+
+class ContextExceeded(AdmissionError):
+    error_code = 'CONTEXT_LENGTH_EXCEEDED'
+
+
+class CountingUnavailable(AdmissionError):
+    status_code = 503
+    error_code = 'TOKEN_COUNT_UNAVAILABLE'
+
+
+@dataclass(frozen=True)
+class AdmissionResult:
+    input_tokens: int
+    reserved_output_tokens: int
+    context_limit: int
+
+    @property
+    def remaining_tokens(self) -> int:
+        return self.context_limit - self.input_tokens - self.reserved_output_tokens
+
+
+def effective_output_reserve(payload: Mapping[str, Any], *, default: int = 2048, max_allowed: int = 2048) -> int:
+    """Reserve actual request output capacity; reject unbounded / excessive requests."""
+    if 'max_tokens' in payload and 'max_completion_tokens' in payload:
+        raise AdmissionError('Specify only one completion limit')
+    value = payload.get('max_completion_tokens', payload.get('max_tokens', default))
+    if isinstance(value, bool) or not isinstance(value, int) or not 1 <= value <= max_allowed:
+        raise AdmissionError(f'Completion token limit must be an integer between 1 and {max_allowed}')
+    return value
+
+
+def admission_from_count(payload: Mapping[str, Any], count_response: Mapping[str, Any], *, context_limit: int = 65536, output_cap: int = 2048) -> AdmissionResult:
+    if not isinstance(payload, Mapping) or not isinstance(payload.get('messages'), list):
+        raise AdmissionError('Missing chat messages')
+    output_tokens = effective_output_reserve(payload, max_allowed=output_cap)
+    count = count_response.get('input_tokens') if isinstance(count_response, Mapping) else None
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise CountingUnavailable('Upstream returned no valid model-aware input token count')
+    result = AdmissionResult(count, output_tokens, context_limit)
+    if result.remaining_tokens < 0:
+        raise ContextExceeded(f'Input {count} + output reserve {output_tokens} exceeds context {context_limit}')
+    return result
+
+
+def count_using_local_llama_server(payload: Mapping[str, Any], *, url: str = 'http://127.0.0.1:8080/v1/chat/completions/input_tokens', timeout: float = 15.0) -> Mapping[str, Any]:
+    """Count the complete request with the same model, template, tools and media.
+
+    URL is a deployment-owned constant, never derived from untrusted client input.
+    This helper should run after gateway authentication and body-size validation.
+    """
+    data = json.dumps(dict(payload), ensure_ascii=False).encode('utf-8')
+    request = Request(url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            if response.status != 200:
+                raise CountingUnavailable(f'Upstream counter returned HTTP {response.status}')
+            answer = json.loads(response.read(1024 * 1024))
+    except CountingUnavailable:
+        raise
+    except (OSError, TimeoutError, ValueError) as exc:
+        raise CountingUnavailable('Model-aware token counter unavailable') from exc
+    if not isinstance(answer, dict):
+        raise CountingUnavailable('Invalid token counter response')
+    return answer
+
+
+def validate_before_proxy(payload: Mapping[str, Any], *, counter: Callable[[Mapping[str, Any]], Mapping[str, Any]] = count_using_local_llama_server, context_limit: int = 65536, output_cap: int = 2048) -> AdmissionResult:
+    """Gateway integration hook: call only AFTER authentication and body-size checks."""
+    if not isinstance(payload, Mapping) or not isinstance(payload.get('messages'), list):
+        raise AdmissionError('Missing chat messages')
+    effective_output_reserve(payload, max_allowed=output_cap)
+    try:
+        count_response = counter(payload)
+    except AdmissionError:
+        raise
+    except Exception as exc:
+        raise CountingUnavailable('Unable to count request tokens') from exc
+    return admission_from_count(payload, count_response, context_limit=context_limit, output_cap=output_cap)
+
+# ==================== Module: runtime_policy.py ====================
+"""A conservative configuration policy; not a replacement for server_runner.py."""
+
+
+def threading_batch_flags(*, available_vcpus: int = 4, configured_threads: int = 4) -> list[str]:
+    if not isinstance(available_vcpus, int) or available_vcpus <= 0:
+        raise ValueError('available_vcpus must be positive')
+    if not isinstance(configured_threads, int) or not 1 <= configured_threads <= available_vcpus:
+        raise ValueError('configured_threads exceeds available vCPUs')
+    return ['--threads', str(configured_threads), '--threads-batch', str(configured_threads), '--batch-size', '2048', '--ubatch-size', '512']
+
+
+def validate_existing_command(command: list[str]) -> None:
+    """Check preservation of critical user-selected settings without rebuilding it."""
+    for flag, value in [('--n-gpu-layers', '99'), ('--split-mode', 'layer'), ('--parallel', '1'), ('--flash-attn', 'on'), ('--cache-type-k', 'q8_0'), ('--cache-type-v', 'q8_0')]:
+        if flag not in command or command.index(flag) == len(command) - 1 or command[command.index(flag) + 1] != value:
+            raise ValueError(f'Expected {flag} {value}')
+    if '--no-mmap' in command or '--no-kv-offload' in command:
+        raise ValueError('Unexpected memory offload / mapping override')
+
 # ==================== Module: server_runner.py ====================
 """
 Phase 4 & 5: Native Server Execution & Readiness Verification.
@@ -1136,7 +1314,13 @@ import json
 import os
 import urllib.request
 import urllib.error
-from typing import Optional
+from typing import Optional, Tuple, Mapping, Any
+
+    validate_before_proxy,
+    AdmissionError,
+    ContextExceeded,
+    CountingUnavailable,
+)
 
 
 class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
@@ -1197,66 +1381,37 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
             pass
         return None
 
-    def validate_context_limits(self, body: Optional[bytes]) -> Tuple[bool, Optional[str]]:
+    def validate_context_limits(self, body: Optional[bytes]) -> Tuple[bool, int, str, Optional[str]]:
         """
         Subtask 4 Model-Aware Context Admission:
         Enforces: Input tokens + Reserved output tokens <= 65,536.
-        First queries native model tokenizer (/v1/chat/completions/input_tokens).
-        Fails closed if body cannot be validated or exceeds ceiling.
+        Returns: (is_valid, http_status, error_code, error_message)
         """
         if not body or not self.path.startswith("/v1/chat/completions"):
-            return True, None
+            return True, 200, "", None
 
         try:
             payload = json.loads(body.decode("utf-8", errors="ignore"))
-            messages = payload.get("messages", [])
-            max_tokens = payload.get("max_tokens", 2048) or 2048
-            ceiling = self.max_context_tokens - max_tokens
-
-            # 1. Attempt model-aware exact token count from upstream llama-server
-            actual_input_tokens = self.query_actual_input_tokens(body)
-            if actual_input_tokens is not None:
-                if actual_input_tokens > ceiling:
-                    return False, (
-                        f"Model-aware input token count ({actual_input_tokens:,} tokens) plus requested generation "
-                        f"({max_tokens:,} tokens) exceeds context limit ({self.max_context_tokens:,}). "
-                        f"Max allowable input is {ceiling:,} tokens."
-                    )
-                return True, None
-
-            # 2. Conservative fallback token accounting (handles multimodal patches & tool definitions)
-            total_chars = 0
-            image_token_allowance = 0
-            for msg in messages:
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    total_chars += len(content)
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict):
-                            if part.get("type") == "text":
-                                total_chars += len(part.get("text", ""))
-                            elif part.get("type") == "image_url":
-                                image_token_allowance += 1024
-
-            # Include tool definitions if present
-            tools = payload.get("tools", [])
-            if tools:
-                total_chars += len(json.dumps(tools))
-
-            # Conservative ratio: 3.5 chars/token for dense code/JSON
-            conservative_prompt_tokens = int(total_chars / 3.5) + image_token_allowance
-
-            if conservative_prompt_tokens > ceiling:
-                return False, (
-                    f"Conservative prompt size (~{conservative_prompt_tokens:,} tokens) plus requested generation "
-                    f"({max_tokens:,} tokens) exceeds context limit ({self.max_context_tokens:,}). "
-                    f"Max allowable input is {ceiling:,} tokens."
-                )
-            return True, None
         except Exception as e:
-            # Fail-closed on malformed JSON payload on /v1/chat/completions
-            return False, f"Malformed JSON payload: {str(e)}"
+            return False, 400, "INVALID_REQUEST", f"Malformed JSON request: {str(e)}"
+
+        counter_url = f"http://127.0.0.1:{self.upstream_port}/v1/chat/completions/input_tokens"
+        try:
+            validate_before_proxy(
+                payload,
+                counter=lambda p: count_using_local_llama_server(p, url=counter_url, timeout=5.0),
+                context_limit=self.max_context_tokens,
+                output_cap=2048,
+            )
+            return True, 200, "", None
+        except ContextExceeded as e:
+            return False, 400, "CONTEXT_LENGTH_EXCEEDED", str(e)
+        except CountingUnavailable as e:
+            return False, 503, "TOKEN_COUNT_UNAVAILABLE", str(e)
+        except AdmissionError as e:
+            return False, e.status_code, e.error_code, str(e)
+        except Exception as e:
+            return False, 503, "TOKEN_COUNT_UNAVAILABLE", f"Token count validation failed: {str(e)}"
 
     def do_GET(self):
         if not self.check_auth():
@@ -1276,15 +1431,15 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
 
-        # Hard Context Limit Check (Subtask 3 Safeguard)
-        valid_context, err_msg = self.validate_context_limits(body)
+        # Hard Context Limit Check (Subtask 4 Model-Aware Safeguard)
+        valid_context, status_code, err_code, err_msg = self.validate_context_limits(body)
         if not valid_context:
-            self.send_response(400)
+            self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             err_resp = json.dumps({
                 "error": {
-                    "code": "CONTEXT_LENGTH_EXCEEDED",
+                    "code": err_code,
                     "message": err_msg,
                     "layer": "auth_gateway",
                 }

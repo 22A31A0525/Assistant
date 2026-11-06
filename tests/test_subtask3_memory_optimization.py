@@ -87,17 +87,29 @@ def test_auth_gateway_hard_context_overflow_rejection():
         "messages": [{"role": "user", "content": "Hello, write a simple function."}],
         "max_tokens": 1024,
     }).encode("utf-8")
-    valid, err = handler.validate_context_limits(normal_payload)
-    assert valid is True
-    assert err is None
+    # In test environment where local llama-server is not running, counter falls closed gracefully
+    # with CountingUnavailable (503) or succeeds when mocked
+    from kaggle.deploy_notebook.context_admission import validate_before_proxy
+    res = validate_before_proxy(
+        json.loads(normal_payload.decode("utf-8")),
+        counter=lambda p: {"input_tokens": 25},
+        context_limit=65536,
+        output_cap=2048,
+    )
+    assert res.input_tokens == 25
+    assert res.remaining_tokens == 65536 - 25 - 1024
 
-    # Oversized payload exceeding max context window (e.g. 260,000 characters ~ 68,000 tokens)
+    # Oversized payload exceeding max context window
     huge_prompt = "x" * 260000
     huge_payload = json.dumps({
         "messages": [{"role": "user", "content": huge_prompt}],
         "max_tokens": 2048,
     }).encode("utf-8")
-    valid, err = handler.validate_context_limits(huge_payload)
-    assert valid is False
-    assert err is not None
-    assert "exceeds context limit" in err
+    from kaggle.deploy_notebook.context_admission import ContextExceeded
+    with pytest.raises(ContextExceeded):
+        validate_before_proxy(
+            json.loads(huge_payload.decode("utf-8")),
+            counter=lambda p: {"input_tokens": 64000},
+            context_limit=65536,
+            output_cap=2048,
+        )

@@ -14,7 +14,14 @@ import json
 import os
 import urllib.request
 import urllib.error
-from typing import Optional
+from typing import Optional, Tuple, Mapping, Any
+
+from kaggle.deploy_notebook.context_admission import (
+    validate_before_proxy,
+    AdmissionError,
+    ContextExceeded,
+    CountingUnavailable,
+)
 
 
 class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
@@ -75,66 +82,37 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
             pass
         return None
 
-    def validate_context_limits(self, body: Optional[bytes]) -> Tuple[bool, Optional[str]]:
+    def validate_context_limits(self, body: Optional[bytes]) -> Tuple[bool, int, str, Optional[str]]:
         """
         Subtask 4 Model-Aware Context Admission:
         Enforces: Input tokens + Reserved output tokens <= 65,536.
-        First queries native model tokenizer (/v1/chat/completions/input_tokens).
-        Fails closed if body cannot be validated or exceeds ceiling.
+        Returns: (is_valid, http_status, error_code, error_message)
         """
         if not body or not self.path.startswith("/v1/chat/completions"):
-            return True, None
+            return True, 200, "", None
 
         try:
             payload = json.loads(body.decode("utf-8", errors="ignore"))
-            messages = payload.get("messages", [])
-            max_tokens = payload.get("max_tokens", 2048) or 2048
-            ceiling = self.max_context_tokens - max_tokens
-
-            # 1. Attempt model-aware exact token count from upstream llama-server
-            actual_input_tokens = self.query_actual_input_tokens(body)
-            if actual_input_tokens is not None:
-                if actual_input_tokens > ceiling:
-                    return False, (
-                        f"Model-aware input token count ({actual_input_tokens:,} tokens) plus requested generation "
-                        f"({max_tokens:,} tokens) exceeds context limit ({self.max_context_tokens:,}). "
-                        f"Max allowable input is {ceiling:,} tokens."
-                    )
-                return True, None
-
-            # 2. Conservative fallback token accounting (handles multimodal patches & tool definitions)
-            total_chars = 0
-            image_token_allowance = 0
-            for msg in messages:
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    total_chars += len(content)
-                elif isinstance(content, list):
-                    for part in content:
-                        if isinstance(part, dict):
-                            if part.get("type") == "text":
-                                total_chars += len(part.get("text", ""))
-                            elif part.get("type") == "image_url":
-                                image_token_allowance += 1024
-
-            # Include tool definitions if present
-            tools = payload.get("tools", [])
-            if tools:
-                total_chars += len(json.dumps(tools))
-
-            # Conservative ratio: 3.5 chars/token for dense code/JSON
-            conservative_prompt_tokens = int(total_chars / 3.5) + image_token_allowance
-
-            if conservative_prompt_tokens > ceiling:
-                return False, (
-                    f"Conservative prompt size (~{conservative_prompt_tokens:,} tokens) plus requested generation "
-                    f"({max_tokens:,} tokens) exceeds context limit ({self.max_context_tokens:,}). "
-                    f"Max allowable input is {ceiling:,} tokens."
-                )
-            return True, None
         except Exception as e:
-            # Fail-closed on malformed JSON payload on /v1/chat/completions
-            return False, f"Malformed JSON payload: {str(e)}"
+            return False, 400, "INVALID_REQUEST", f"Malformed JSON request: {str(e)}"
+
+        counter_url = f"http://127.0.0.1:{self.upstream_port}/v1/chat/completions/input_tokens"
+        try:
+            validate_before_proxy(
+                payload,
+                counter=lambda p: count_using_local_llama_server(p, url=counter_url, timeout=5.0),
+                context_limit=self.max_context_tokens,
+                output_cap=2048,
+            )
+            return True, 200, "", None
+        except ContextExceeded as e:
+            return False, 400, "CONTEXT_LENGTH_EXCEEDED", str(e)
+        except CountingUnavailable as e:
+            return False, 503, "TOKEN_COUNT_UNAVAILABLE", str(e)
+        except AdmissionError as e:
+            return False, e.status_code, e.error_code, str(e)
+        except Exception as e:
+            return False, 503, "TOKEN_COUNT_UNAVAILABLE", f"Token count validation failed: {str(e)}"
 
     def do_GET(self):
         if not self.check_auth():
@@ -154,15 +132,15 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else None
 
-        # Hard Context Limit Check (Subtask 3 Safeguard)
-        valid_context, err_msg = self.validate_context_limits(body)
+        # Hard Context Limit Check (Subtask 4 Model-Aware Safeguard)
+        valid_context, status_code, err_code, err_msg = self.validate_context_limits(body)
         if not valid_context:
-            self.send_response(400)
+            self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
             err_resp = json.dumps({
                 "error": {
-                    "code": "CONTEXT_LENGTH_EXCEEDED",
+                    "code": err_code,
                     "message": err_msg,
                     "layer": "auth_gateway",
                 }

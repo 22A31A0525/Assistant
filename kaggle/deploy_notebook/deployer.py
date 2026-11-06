@@ -29,6 +29,9 @@ MODULE_FILES = [
     (Path(__file__).resolve().parent / "environment.py", "environment.py"),
     (Path(__file__).resolve().parent / "model_resolver.py", "model_resolver.py"),
     (Path(__file__).resolve().parent / "gpu_allocator.py", "gpu_allocator.py"),
+    (Path(__file__).resolve().parent / "latency_telemetry.py", "latency_telemetry.py"),
+    (Path(__file__).resolve().parent / "context_admission.py", "context_admission.py"),
+    (Path(__file__).resolve().parent / "runtime_policy.py", "runtime_policy.py"),
     (Path(__file__).resolve().parent / "server_runner.py", "server_runner.py"),
     (Path(__file__).resolve().parent / "auth_gateway.py", "auth_gateway.py"),
 ]
