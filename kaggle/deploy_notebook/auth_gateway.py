@@ -188,19 +188,27 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(e_data)
         except Exception as e:
+            # Client disconnected early (e.g. BrokenPipeError / ConnectionResetError)
+            if "Broken pipe" in str(e) or "Errno 32" in str(e) or isinstance(e, BrokenPipeError):
+                # Suppress noisy traceback when client closes connection early
+                return
+
             # When llama-server backend is down, dead, or restarting -> Explicit 503 Service Unavailable
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "5")
-            self.end_headers()
-            err = json.dumps({
-                "error": {
-                    "code": "SERVICE_UNAVAILABLE",
-                    "message": f"Inference engine unavailable or initializing: {str(e)}",
-                    "layer": "auth_gateway"
-                }
-            }).encode("utf-8")
-            self.wfile.write(err)
+            try:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "5")
+                self.end_headers()
+                err = json.dumps({
+                    "error": {
+                        "code": "SERVICE_UNAVAILABLE",
+                        "message": f"Inference engine unavailable or initializing: {str(e)}",
+                        "layer": "auth_gateway"
+                    }
+                }).encode("utf-8")
+                self.wfile.write(err)
+            except Exception:
+                pass
 
     def do_SHUTDOWN(self):
         """Emergency remote shutdown signal over authenticated gateway."""

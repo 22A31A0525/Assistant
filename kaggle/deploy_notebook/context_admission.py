@@ -66,6 +66,21 @@ def count_using_local_llama_server(payload: Mapping[str, Any], *, url: str = 'ht
     URL is a deployment-owned constant, never derived from untrusted client input.
     This helper should run after gateway authentication and body-size validation.
     """
+    # Fast-path check: If raw character length already exceeds absolute physical limit,
+    # reject immediately without generating an expensive multi-minute prompt eval in the upstream engine.
+    messages = payload.get('messages', []) if isinstance(payload, Mapping) else []
+    char_sum = 0
+    if isinstance(messages, list):
+        for m in messages:
+            if isinstance(m, Mapping):
+                c = m.get('content', '')
+                if isinstance(c, str):
+                    char_sum += len(c)
+    # 260,000 characters is >65,000 tokens (even at dense 4 chars/token).
+    # If the text alone exceeds 250,000 characters, it cannot fit in 65,536 tokens.
+    if char_sum > 250000:
+        raise ContextExceeded(f'Prompt character length ({char_sum:,}) exceeds absolute maximum context ceiling.')
+
     data = json.dumps(dict(payload), ensure_ascii=False).encode('utf-8')
     request = Request(url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
     try:

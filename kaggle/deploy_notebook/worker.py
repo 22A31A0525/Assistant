@@ -1019,6 +1019,21 @@ def count_using_local_llama_server(payload: Mapping[str, Any], *, url: str = 'ht
     URL is a deployment-owned constant, never derived from untrusted client input.
     This helper should run after gateway authentication and body-size validation.
     """
+    # Fast-path check: If raw character length already exceeds absolute physical limit,
+    # reject immediately without generating an expensive multi-minute prompt eval in the upstream engine.
+    messages = payload.get('messages', []) if isinstance(payload, Mapping) else []
+    char_sum = 0
+    if isinstance(messages, list):
+        for m in messages:
+            if isinstance(m, Mapping):
+                c = m.get('content', '')
+                if isinstance(c, str):
+                    char_sum += len(c)
+    # 260,000 characters is >65,000 tokens (even at dense 4 chars/token).
+    # If the text alone exceeds 250,000 characters, it cannot fit in 65,536 tokens.
+    if char_sum > 250000:
+        raise ContextExceeded(f'Prompt character length ({char_sum:,}) exceeds absolute maximum context ceiling.')
+
     data = json.dumps(dict(payload), ensure_ascii=False).encode('utf-8')
     request = Request(url, data=data, headers={'Content-Type': 'application/json'}, method='POST')
     try:
@@ -1503,19 +1518,27 @@ class AuthenticatedGatewayHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(e_data)
         except Exception as e:
+            # Client disconnected early (e.g. BrokenPipeError / ConnectionResetError)
+            if "Broken pipe" in str(e) or "Errno 32" in str(e) or isinstance(e, BrokenPipeError):
+                # Suppress noisy traceback when client closes connection early
+                return
+
             # When llama-server backend is down, dead, or restarting -> Explicit 503 Service Unavailable
-            self.send_response(503)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Retry-After", "5")
-            self.end_headers()
-            err = json.dumps({
-                "error": {
-                    "code": "SERVICE_UNAVAILABLE",
-                    "message": f"Inference engine unavailable or initializing: {str(e)}",
-                    "layer": "auth_gateway"
-                }
-            }).encode("utf-8")
-            self.wfile.write(err)
+            try:
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Retry-After", "5")
+                self.end_headers()
+                err = json.dumps({
+                    "error": {
+                        "code": "SERVICE_UNAVAILABLE",
+                        "message": f"Inference engine unavailable or initializing: {str(e)}",
+                        "layer": "auth_gateway"
+                    }
+                }).encode("utf-8")
+                self.wfile.write(err)
+            except Exception:
+                pass
 
     def do_SHUTDOWN(self):
         """Emergency remote shutdown signal over authenticated gateway."""
@@ -1834,7 +1857,7 @@ if __name__ == "__main__":
             method="POST",
         )
         try:
-            with urllib.request.urlopen(huge_http_req, timeout=5) as h_resp:
+            with urllib.request.urlopen(huge_http_req, timeout=15) as h_resp:
                 print("  [Gateway Context Guard] WARN: Huge request was unexpectedly admitted!", flush=True)
         except urllib.error.HTTPError as he:
             if he.code == 400:

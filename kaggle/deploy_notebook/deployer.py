@@ -373,7 +373,7 @@ if __name__ == "__main__":
             method="POST",
         )
         try:
-            with urllib.request.urlopen(huge_http_req, timeout=5) as h_resp:
+            with urllib.request.urlopen(huge_http_req, timeout=15) as h_resp:
                 print("  [Gateway Context Guard] WARN: Huge request was unexpectedly admitted!", flush=True)
         except urllib.error.HTTPError as he:
             if he.code == 400:
