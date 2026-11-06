@@ -42,7 +42,8 @@ def fetch_kernel_logs(kernel_id: Optional[str] = None) -> str:
         active, _ = load_accounts()
         if not active or not active.username:
             return ""
-        slug = f"ornith-worker-{active.username.lower().replace('_', '-')}"
+        # Match current unified naming scheme
+        slug = f"assistant-worker-{active.username.lower().replace('_', '-')}"
         target_id = f"{active.username}/{slug}"
 
     try:

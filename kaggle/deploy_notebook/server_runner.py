@@ -134,12 +134,13 @@ def verify_vision_pipeline(port: int = 8080, model_alias: str = "qwen38-27b") ->
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Describe this image in 5 words."},
+                    {"type": "text", "text": "Describe this image in 5 words. Do not think. Answer directly."},
                     {"type": "image_url", "image_url": {"url": tiny_png_uri}},
                 ]
             }
         ],
-        "max_tokens": 128,  # Ample token budget for thinking tokens + final content
+        "max_tokens": 256,
+        "chat_template_kwargs": {"enable_thinking": False},
     }).encode("utf-8")
 
     try:
