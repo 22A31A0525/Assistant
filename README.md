@@ -15,7 +15,8 @@ Assistant/
 ├── README.md                  # Project overview & architectural guide
 ├── assistant_persona/         # Persona profiles, system prompts & chat bindings
 ├── tests/                     # Unit test suites (pytest)
-│   └── test_deploy_notebook.py
+│   ├── test_deploy_notebook.py
+│   └── test_model_compatibility.py
 └── kaggle/                    # Dedicated Kaggle remote GPU backend package
     ├── __init__.py
     ├── cli.py                 # Unified Kaggle Hub CLI (python -m kaggle.cli)
@@ -24,18 +25,19 @@ Assistant/
     │   ├── auth_config/       # Multi-account credentials & active switcher
     │   │   ├── manager.py     # Account loader, synchronizer & validator
     │   │   └── models.py      # Account data models & slug generator
-    │   ├── model_config/      # Curated 3-model catalog & hardware profiles
+    │   ├── model_config/      # Curated 3-model catalog, manifests & profiles
+    │   │   ├── manifest.py    # Subtask 2 ModelCompatibilityManifest & CapabilityState
     │   │   ├── catalog.py     # Registry with fixed owner datasets & vision mmproj
     │   │   ├── common.py      # Shared CUDA 12 & runtime wheel datasets
     │   │   └── profile.py     # ModelProfile dataclass (text & multimodal)
     │   └── api_end_point_config/ # Endpoint resolver, ping probe & tunnel sync
     │       ├── llama_config.py
     │       └── tunnel.py
-    ├── deploy_notebook/       # Subtask 1 Modular Remote Deployment Subsystem
+    ├── deploy_notebook/       # Modular Remote Deployment Subsystem
     │   ├── environment.py     # Strict 2x T4 check, CUDA 12 packages, & physical VRAM query
-    │   ├── model_resolver.py  # Deterministic weights resolution & vision mmproj verification
+    │   ├── model_resolver.py  # Binary GGUF metadata parser & cautious tensor logging
     │   ├── gpu_allocator.py   # Mathematical KV cache estimation & admission check
-    │   ├── server_runner.py   # Single authoritative llama-server command builder & readiness probe
+    │   ├── server_runner.py   # Single authoritative command builder, readiness probe, & role validation
     │   ├── auth_gateway.py    # Zero-dependency reverse proxy with Bearer auth & chunked SSE streaming
     │   ├── metadata.py        # Generates kernel-metadata.json with shared wheels
     │   ├── deployer.py        # Bundles sub-modules into self-contained worker.py & pushes to Kaggle
@@ -46,7 +48,7 @@ Assistant/
 
 ---
 
-## 🚀 Features Implemented (Subtask 1: Dual-T4 Remote Infrastructure)
+## 🚀 Subtask 1: Dual-T4 Remote Infrastructure
 
 ### 1. Unified Kaggle Control Center
 Run from the workspace root:
@@ -83,11 +85,31 @@ Operations available:
 - **Physical GPU VRAM Monitoring:** Post-startup `nvidia-smi` query reporting exact real-time VRAM allocation (`used_mib` / `total_mib`).
 - **Host CPU RAM Visibility:** Inspects `/proc/meminfo` at startup and readiness to track host memory, Linux page cache (`Buffers + Cached`), and swap pressure without external dependencies.
 
-### 5. Multimodal Vision Pipeline Verification (`server_runner.py`)
-- Embeds end-to-end multimodal validation with test image projection during startup.
-- Strictly validates whether the model generates real semantic content, reporting **Inconclusive** if the model exhausts tokens in reasoning without answering, preventing false-positive readiness claims.
+---
 
-### 6. Curated Model Catalog (`kaggle/config/model_config/`)
+## 🧠 Subtask 2: Model Loading & Inference Engine Architecture
+
+### 1. Model Compatibility Manifest (`manifest.py`)
+A formal metadata and capability tracker governing how `Qwen3.8-27B` is interpreted and executed:
+- **Dynamic Binary GGUF Inspection:** Reads header fields directly from the file (detecting `architecture: qwen3`, layer count, and embedded template presence) without hardcoded assumptions.
+- **Template Source Classification:** Tracks whether the chat template is `EMBEDDED_GGUF_TEMPLATE`, `RUNTIME_BUILTIN_FALLBACK`, or `UNVERIFIED_TEMPLATE`.
+
+### 2. Independent Capability Gating
+Decouples model features so unverified modes cannot fail silently:
+- `text`: `VERIFIED_BASIC`
+- `vision_simple`: `VERIFIED_BASIC` (authorized upon passing semantic visual evaluation)
+- `vision_complex`: `UNVERIFIED` (remains gated for dedicated multi-image and screenshot verification)
+- `tool_calling`: `UNVERIFIED` (remains gated for Codex agent multi-turn validation)
+
+### 3. Message Role & Tool Schema Formatting Verification (`server_runner.py`)
+- Validates that `system`, `user`, and `assistant` role boundaries transition cleanly in the model's native Jinja template.
+- Submits OpenAI-standard function tool definitions (`tools: [...]`) to confirm that Qwen's template engine parses and accepts tool calling schemas without crashing.
+
+### 4. Handling Architectural Warnings
+- **Auxiliary Tensors (`blk.64`):** Categorized conservatively as `DETECTED_UNVERIFIED_AUXILIARY_LAYER`. In Qwen 3/3.8 architectures, this is the trailing MTP (Multi-Token Prediction) speculative drafting block. Kept safely disabled (`--spec-type none` / no draft flags) to prevent memory index assertion crashes.
+- **Multimodal Token Positions (`non-consecutive token position`):** Documented as an expected artifact of Qwen-VL's M-RoPE 2D/3D grid image patch coordinates during sub-batching. Basic semantic output (*"Solid red square image"*) verified.
+
+### 5. Curated Model Catalog (`kaggle/config/model_config/`)
 
 | Model | Capability | Context | Primary Kaggle Source | Vision Projector (`mmproj`) |
 |---|---|---|---|---|
@@ -99,8 +121,14 @@ Operations available:
 
 ## 🧪 Testing & Verification
 
-Run the test suite locally:
+Run the full pytest suite:
 ```bash
-python -m pytest tests/test_deploy_notebook.py -v
+python -m pytest tests/ -v
 ```
-Verifies command line construction, single-slot enforcement, reasoning bypass flags, VRAM fallback handling, per-GPU admission distributions, system RAM structure, and gateway security boundaries.
+**Test Coverage (10/10 Passing):**
+- Native `llama-server` command flag generation (`--parallel 1`, `--no-reasoning-preserve`, `--flash-attn on`, `--ctx-size 65536`).
+- Hardware VRAM and system host RAM inspection fallbacks.
+- Bearer token security boundary & 401 gatekeeper.
+- Per-GPU memory allocation & mathematical layer distribution check.
+- Manifest dynamic metadata recording & independent capability transitions.
+- Chat template source classification (`EMBEDDED_GGUF_TEMPLATE`).
